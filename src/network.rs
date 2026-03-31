@@ -266,6 +266,8 @@ pub struct RawSocketState {
     pub g_packet_buf: Vec<u8>,
     pub g_packet_buf_len: i32,
     pub lower_level: bool,
+    #[cfg(feature = "xdp")]
+    pub xdp: Option<crate::xdp::XdpState>,
 }
 
 impl RawSocketState {
@@ -338,11 +340,47 @@ impl RawSocketState {
             g_packet_buf: vec![0u8; HUGE_BUF_LEN],
             g_packet_buf_len: -1,
             lower_level: config.lower_level_enabled,
+            #[cfg(feature = "xdp")]
+            xdp: None,
+        })
+    }
+
+    /// Initialize `RawSocketState` with AF_XDP transport instead of raw sockets.
+    ///
+    /// The XSK socket fd is used as `raw_recv_fd` so the existing mio
+    /// registration in client/server event loops works unchanged.
+    #[cfg(feature = "xdp")]
+    pub fn init_xdp(config: &Config, ebpf_bytes: &[u8]) -> io::Result<Self> {
+        let xdp = crate::xdp::XdpState::init(
+            ebpf_bytes,
+            &config.xdp_ifname,
+            config.xdp_queue_id,
+            config.xdp_zerocopy,
+            config.xdp_dst_mac,
+        )?;
+        let recv_fd = xdp.xsk.fd(); // pollable fd for mio
+
+        Ok(Self {
+            raw_recv_fd: recv_fd,
+            raw_send_fd: recv_fd,
+            filter_port: -1,
+            seq_mode: config.seq_mode,
+            ip_id_counter: 0,
+            g_packet_buf: vec![0u8; HUGE_BUF_LEN],
+            g_packet_buf_len: -1,
+            lower_level: false,
+            xdp: Some(xdp),
         })
     }
 
     /// Attach BPF filter for the specified port.
     pub fn init_filter(&mut self, port: u16, config: &Config) {
+        #[cfg(feature = "xdp")]
+        if self.xdp.is_some() {
+            log::info!("XDP mode: BPF filter handled by eBPF program");
+            return;
+        }
+
         if config.disable_bpf_filter {
             return;
         }
@@ -381,7 +419,14 @@ impl RawSocketState {
                 iph.check = csum(hdr_bytes);
 
                 packet[..20].copy_from_slice(iph.as_bytes());
-                packet[20..].copy_from_slice(payload);
+                packet[20..20 + payload.len()].copy_from_slice(payload);
+
+                // ── XDP path: prepend Ethernet header, write to TX ring ──
+                #[cfg(feature = "xdp")]
+                if let Some(ref mut xdp) = self.xdp {
+                    xdp.send_ip_packet(&packet[..ip_payload_len], 0x0800)?;
+                    return Ok(ip_payload_len);
+                }
 
                 // Send
                 let dst_addr = libc::sockaddr_in {
@@ -418,6 +463,28 @@ impl RawSocketState {
 
     /// Receive a raw IP packet. Returns (payload_data, payload_len).
     pub fn recv_raw_ip(&mut self, raw_info: &mut RawInfo) -> io::Result<Vec<u8>> {
+        // ── XDP path: read L2 frame, strip Ethernet, parse IP ──
+        #[cfg(feature = "xdp")]
+        if let Some(ref mut xdp) = self.xdp {
+            let (ethertype, ip_data) = xdp.recv_ip_packet()?;
+            if ethertype != 0x0800 {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "non-IPv4"));
+            }
+            if ip_data.len() < 20 {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "packet too short"));
+            }
+            let ihl = (ip_data[0] & 0x0F) as usize * 4;
+            if ip_data.len() < ihl {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "IP header truncated"));
+            }
+            let saddr = u32::from_be_bytes([ip_data[12], ip_data[13], ip_data[14], ip_data[15]]);
+            let daddr = u32::from_be_bytes([ip_data[16], ip_data[17], ip_data[18], ip_data[19]]);
+            raw_info.recv_info.src_ip = IpAddr::V4(Ipv4Addr::from(saddr));
+            raw_info.recv_info.dst_ip = IpAddr::V4(Ipv4Addr::from(daddr));
+            raw_info.recv_info.protocol = ip_data[9];
+            return Ok(ip_data[ihl..].to_vec());
+        }
+
         // Use pre-allocated g_packet_buf instead of allocating 65KB per call
         let mut addr: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
         let mut addr_len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
@@ -469,7 +536,14 @@ impl RawSocketState {
     }
 
     /// Discard one pending raw packet.
-    pub fn discard_raw_packet(&self) {
+    pub fn discard_raw_packet(&mut self) {
+        #[cfg(feature = "xdp")]
+        if self.xdp.is_some() {
+            // In XDP mode, consume and discard one frame from the RX ring
+            let _ = self.recv_raw_ip(&mut RawInfo::default());
+            return;
+        }
+
         let mut buf = [0u8; 1];
         unsafe {
             libc::recv(self.raw_recv_fd, buf.as_mut_ptr() as *mut libc::c_void, 0, 0);

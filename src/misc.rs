@@ -166,6 +166,21 @@ pub struct Cli {
     /// Bind raw socket to device
     #[arg(long = "dev")]
     pub dev: Option<String>,
+
+    /// AF_XDP mode: "if_name#dest_mac" (e.g. "eth0#aa:bb:cc:dd:ee:ff")
+    #[cfg(feature = "xdp")]
+    #[arg(long = "xdp")]
+    pub xdp: Option<String>,
+
+    /// AF_XDP RX queue ID (default 0)
+    #[cfg(feature = "xdp")]
+    #[arg(long = "xdp-queue", default_value = "0")]
+    pub xdp_queue: u32,
+
+    /// AF_XDP zero-copy mode (requires driver support)
+    #[cfg(feature = "xdp")]
+    #[arg(long = "xdp-zerocopy")]
+    pub xdp_zerocopy: bool,
 }
 
 // ─── Config struct ──────────────────────────────────────────────────────────
@@ -208,6 +223,16 @@ pub struct Config {
     pub clear_iptables: bool,
     pub wait_xtables_lock: bool,
     pub dev: String,
+    #[cfg(feature = "xdp")]
+    pub xdp_enabled: bool,
+    #[cfg(feature = "xdp")]
+    pub xdp_ifname: String,
+    #[cfg(feature = "xdp")]
+    pub xdp_dst_mac: [u8; 6],
+    #[cfg(feature = "xdp")]
+    pub xdp_queue_id: u32,
+    #[cfg(feature = "xdp")]
+    pub xdp_zerocopy: bool,
 }
 
 impl Config {
@@ -280,6 +305,9 @@ impl Config {
 
         let disable_anti_replay = cli.disable_anti_replay || auth_mode == AuthMode::None;
 
+        #[cfg(feature = "xdp")]
+        let (xdp_enabled, xdp_ifname, xdp_dst_mac) = parse_xdp_opt(&cli.xdp);
+
         Config {
             program_mode,
             raw_mode,
@@ -317,6 +345,16 @@ impl Config {
             clear_iptables: cli.clear,
             wait_xtables_lock: cli.wait_lock,
             dev: cli.dev.clone().unwrap_or_default(),
+            #[cfg(feature = "xdp")]
+            xdp_enabled,
+            #[cfg(feature = "xdp")]
+            xdp_ifname,
+            #[cfg(feature = "xdp")]
+            xdp_dst_mac,
+            #[cfg(feature = "xdp")]
+            xdp_queue_id: cli.xdp_queue,
+            #[cfg(feature = "xdp")]
+            xdp_zerocopy: cli.xdp_zerocopy,
         }
     }
 }
@@ -341,6 +379,38 @@ fn parse_lower_level(opt: &Option<String>) -> (bool, bool, String, [u8; 6]) {
                 (true, true, if_name, mac)
             } else {
                 log::error!("--lower-level format: if_name#dest_mac");
+                myexit(-1);
+            }
+        }
+    }
+}
+
+/// Parse `--xdp` option: `"if_name#dest_mac"` (same format as `--lower-level`).
+/// Returns `(enabled, ifname, dst_mac)`.
+#[cfg(feature = "xdp")]
+fn parse_xdp_opt(opt: &Option<String>) -> (bool, String, [u8; 6]) {
+    match opt {
+        None => (false, String::new(), [0; 6]),
+        Some(s) => {
+            // Format: if_name#aa:bb:cc:dd:ee:ff
+            if let Some(idx) = s.find('#') {
+                let if_name = s[..idx].to_string();
+                let mac_str = &s[idx + 1..];
+                let parts: Vec<u8> = mac_str
+                    .split(':')
+                    .filter_map(|p| u8::from_str_radix(p, 16).ok())
+                    .collect();
+                if parts.len() != 6 {
+                    log::error!("--xdp: invalid MAC address '{}', expected 6 hex octets", mac_str);
+                    myexit(-1);
+                }
+                let mut mac = [0u8; 6];
+                for (i, &b) in parts.iter().enumerate().take(6) {
+                    mac[i] = b;
+                }
+                (true, if_name, mac)
+            } else {
+                log::error!("--xdp format: if_name#dest_mac (e.g. eth0#aa:bb:cc:dd:ee:ff)");
                 myexit(-1);
             }
         }

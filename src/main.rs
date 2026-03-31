@@ -59,7 +59,24 @@ fn main() {
         std::process::exit(0);
     }
 
-    // Initialize raw sockets
+    // Initialize raw sockets — dispatch based on XDP feature/config
+    #[cfg(feature = "xdp")]
+    let mut raw_state = if config.xdp_enabled {
+        let ebpf_bytes = include_bytes!(concat!(env!("OUT_DIR"), "/udp2raw-ebpf"));
+        RawSocketState::init_xdp(&config, ebpf_bytes).unwrap_or_else(|e| {
+            log::error!("AF_XDP init failed: {}", e);
+            log::error!("hint: requires CAP_NET_ADMIN+CAP_BPF, kernel ≥4.18, NIC with XDP support");
+            std::process::exit(-1);
+        })
+    } else {
+        RawSocketState::init(&config).unwrap_or_else(|e| {
+            log::error!("raw socket init failed: {}", e);
+            log::error!("hint: run as root or with CAP_NET_RAW capability");
+            std::process::exit(-1);
+        })
+    };
+
+    #[cfg(not(feature = "xdp"))]
     let mut raw_state = RawSocketState::init(&config).unwrap_or_else(|e| {
         log::error!("raw socket init failed: {}", e);
         log::error!("hint: run as root or with CAP_NET_RAW capability");
