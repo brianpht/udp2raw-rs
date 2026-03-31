@@ -1,0 +1,22 @@
+[package]
+name = "udp2raw-ebpf"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+aya-ebpf = "0.1"
+
+[[bin]]
+name = "udp2raw-ebpf"
+path = "src/main.rs"
+
+[profile.dev]
+opt-level = 2
+panic = "abort"
+debug = false
+overflow-checks = false
+
+[profile.release]
+panic = "abort"
+lto = true
+

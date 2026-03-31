@@ -821,7 +821,7 @@ the encryption or wire-protocol layers.
 
 ```
                  ┌─── AF_XDP adds/strips this ───┐
-                 │                                │
+                 │                               │
     L2:  [dst_mac:6][src_mac:6][ethertype:2]  [IP header][TCP/UDP/ICMP][encrypted payload]
                                                └──────── identical bytes ────────────────┘
 ```

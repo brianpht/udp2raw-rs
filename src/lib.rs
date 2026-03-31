@@ -16,3 +16,6 @@ pub mod misc;
 pub mod network;
 pub mod server;
 
+#[cfg(feature = "xdp")]
+pub mod xdp;
+

@@ -1,3 +1,6 @@
+[workspace]
+exclude = ["udp2raw-ebpf"]
+
 [package]
 name = "udp2raw"
 version = "0.1.0"
@@ -11,6 +14,10 @@ path = "src/lib.rs"
 [[bin]]
 name = "udp2raw"
 path = "src/main.rs"
+
+[features]
+default = []
+xdp = ["dep:aya", "dep:aya-build"]
 
 [dependencies]
 # CLI
@@ -46,6 +53,12 @@ cipher = { version = "0.4", features = ["block-padding"] }
 rand = "0.8"
 bytes = "1"
 lru = "0.12"
+
+# AF_XDP (optional — only with --features xdp on Linux)
+aya = { version = "0.13", optional = true }
+
+[build-dependencies]
+aya-build = { version = "0.1", optional = true }
 
 [dev-dependencies]
 hex = "0.4"
