@@ -4,8 +4,10 @@
 use crate::common::*;
 use crate::connection::*;
 use crate::encrypt::Encryptor;
+use crate::mio_fd::MioFdSource;
 use crate::misc::{self, Config};
-use crate::network::{self, RawSocketState};
+use crate::network;
+use crate::transport::RawTransport;
 use std::io;
 use std::net::SocketAddr;
 use std::os::unix::io::RawFd;
@@ -17,44 +19,11 @@ const UDP_TOKEN: Token = Token(0);
 const RAW_TOKEN: Token = Token(1);
 const FIFO_TOKEN: Token = Token(2);
 
-struct MioFdSource {
-    fd: RawFd,
-}
-
-impl mio::event::Source for MioFdSource {
-    fn register(
-        &mut self,
-        registry: &mio::Registry,
-        token: Token,
-        interests: Interest,
-    ) -> io::Result<()> {
-        registry.register(
-            &mut mio::unix::SourceFd(&self.fd),
-            token,
-            interests,
-        )
-    }
-    fn reregister(
-        &mut self,
-        registry: &mio::Registry,
-        token: Token,
-        interests: Interest,
-    ) -> io::Result<()> {
-        registry.reregister(
-            &mut mio::unix::SourceFd(&self.fd),
-            token,
-            interests,
-        )
-    }
-    fn deregister(&mut self, registry: &mio::Registry) -> io::Result<()> {
-        registry.deregister(&mut mio::unix::SourceFd(&self.fd))
-    }
-}
 
 pub fn client_event_loop(
     config: &Config,
     encryptor: &Encryptor,
-    raw_state: &mut RawSocketState,
+    raw_state: &mut RawTransport,
     const_id: MyId,
 ) -> io::Result<()> {
     let mut conn_info = ConnInfo::new_client();
@@ -100,7 +69,7 @@ pub fn client_event_loop(
             let mut sa: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
             sa.sin6_family = libc::AF_INET6 as u16;
             sa.sin6_port = a.port().to_be();
-            sa.sin6_addr = unsafe { std::mem::transmute(*a.ip()) };
+            sa.sin6_addr = libc::in6_addr { s6_addr: a.ip().octets() };
             if unsafe {
                 libc::bind(
                     udp_fd,
@@ -128,7 +97,7 @@ pub fn client_event_loop(
 
     let mut udp_source = MioFdSource { fd: udp_fd };
     let mut raw_source = MioFdSource {
-        fd: raw_state.raw_recv_fd,
+        fd: raw_state.recv_fd(),
     };
 
     poll.registry()
@@ -214,7 +183,7 @@ pub fn client_event_loop(
 
 fn client_on_timer(
     conn_info: &mut ConnInfo,
-    raw_state: &mut RawSocketState,
+    raw_state: &mut RawTransport,
     encryptor: &Encryptor,
     config: &Config,
     const_id: MyId,
@@ -226,6 +195,8 @@ fn client_on_timer(
         ConnectionState::Client(s) => s,
         _ => return,
     };
+
+    let now = get_current_time();
 
     match state {
         ClientState::Idle => {
@@ -288,13 +259,12 @@ fn client_on_timer(
                 conn_info.state = ConnectionState::Client(ClientState::Handshake1);
             }
 
-            conn_info.last_state_time = get_current_time();
+            conn_info.last_state_time = now;
             conn_info.last_hb_sent_time = 0;
             log::info!("state -> {:?}, src_port={}", conn_info.state, conn_info.raw_info.send_info.src_port);
         }
 
         ClientState::TcpHandshake | ClientState::TcpHandshakeDummy => {
-            let now = get_current_time();
             if now - conn_info.last_state_time > misc::CLIENT_HANDSHAKE_TIMEOUT {
                 conn_info.state = ConnectionState::Client(ClientState::Idle);
                 log::info!("tcp handshake timeout, back to idle");
@@ -307,15 +277,16 @@ fn client_on_timer(
                     conn_info.raw_info.send_info.ack = false;
                     conn_info.raw_info.send_info.seq = get_true_random_number();
                     conn_info.raw_info.send_info.ack_seq = get_true_random_number();
+                    conn_info.raw_info.send_info.has_ts = true;
+                    conn_info.raw_info.send_info.ts = (now & 0xFFFFFFFF) as u32;
                 }
                 let _ = raw_state.send_raw0(&mut conn_info.raw_info, &[], config.raw_mode);
-                conn_info.last_hb_sent_time = get_current_time();
+                conn_info.last_hb_sent_time = now;
                 log::info!("(re)sent TCP SYN");
             }
         }
 
         ClientState::Handshake1 => {
-            let now = get_current_time();
             if now - conn_info.last_state_time > misc::CLIENT_HANDSHAKE_TIMEOUT {
                 conn_info.state = ConnectionState::Client(ClientState::Idle);
                 log::info!("handshake1 timeout, back to idle");
@@ -347,13 +318,12 @@ fn client_on_timer(
                         .wrapping_add(conn_info.raw_info.send_info.data_len as u32);
                 }
 
-                conn_info.last_hb_sent_time = get_current_time();
+                conn_info.last_hb_sent_time = now;
                 log::info!("(re)sent handshake1");
             }
         }
 
         ClientState::Handshake2 => {
-            let now = get_current_time();
             if now - conn_info.last_state_time > misc::CLIENT_HANDSHAKE_TIMEOUT {
                 conn_info.state = ConnectionState::Client(ClientState::Idle);
                 log::info!("handshake2 timeout, back to idle");
@@ -381,14 +351,13 @@ fn client_on_timer(
                         .wrapping_add(conn_info.raw_info.send_info.data_len as u32);
                 }
 
-                conn_info.last_hb_sent_time = get_current_time();
+                conn_info.last_hb_sent_time = now;
                 log::info!("(re)sent handshake2");
             }
         }
 
         ClientState::Ready => {
             *fail_time_counter = 0;
-            let now = get_current_time();
 
             if now - conn_info.last_hb_recv_time > misc::CLIENT_CONN_TIMEOUT {
                 conn_info.state = ConnectionState::Client(ClientState::Idle);
@@ -409,14 +378,14 @@ fn client_on_timer(
             log::debug!("heartbeat sent <{:x},{:x}>", conn_info.opposite_id, conn_info.my_id);
             let hb_data = if config.hb_mode == 0 { &[] as &[u8] } else { hb_buf };
             let _ = send_safer(raw_state, conn_info, b'h', hb_data, encryptor, config);
-            conn_info.last_hb_sent_time = get_current_time();
+            conn_info.last_hb_sent_time = now;
         }
     }
 }
 
 fn client_on_raw_recv(
     conn_info: &mut ConnInfo,
-    raw_state: &mut RawSocketState,
+    raw_state: &mut RawTransport,
     encryptor: &Encryptor,
     config: &Config,
     udp_fd: RawFd,
@@ -432,8 +401,9 @@ fn client_on_raw_recv(
         }
 
         ClientState::TcpHandshake | ClientState::TcpHandshakeDummy => {
-            let data = match raw_state.recv_raw0(&mut conn_info.raw_info, config.raw_mode) {
-                Ok(d) => d,
+            let mut recv_buf = [0u8; BUF_LEN];
+            let data_len = match raw_state.recv_raw0(&mut conn_info.raw_info, config.raw_mode, &mut recv_buf) {
+                Ok(n) => n,
                 Err(_) => return,
             };
             let ri = &conn_info.raw_info.recv_info;
@@ -442,7 +412,7 @@ fn client_on_raw_recv(
             {
                 return;
             }
-            if data.is_empty() && ri.syn && ri.ack {
+            if data_len == 0 && ri.syn && ri.ack {
                 conn_info.state = ConnectionState::Client(ClientState::Handshake1);
                 conn_info.last_state_time = get_current_time();
                 conn_info.last_hb_sent_time = 0;
@@ -451,15 +421,16 @@ fn client_on_raw_recv(
         }
 
         ClientState::Handshake1 => {
-            let data = match recv_bare(raw_state, &mut conn_info.raw_info, encryptor, config.raw_mode) {
-                Ok(d) => d,
+            let mut data = [0u8; BUF_LEN];
+            let data_len = match recv_bare(raw_state, &mut conn_info.raw_info, encryptor, config.raw_mode, &mut data) {
+                Ok(n) => n,
                 Err(_) => return,
             };
-            if data.len() < 12 {
+            if data_len < 12 {
                 return;
             }
             let (tmp_opposite_id, tmp_my_id, _tmp_const_id) =
-                match bytes_to_numbers(&data) {
+                match bytes_to_numbers(&data[..data_len]) {
                     Some(ids) => ids,
                     None => return,
                 };
@@ -479,6 +450,19 @@ fn client_on_raw_recv(
         }
 
         ClientState::Handshake2 | ClientState::Ready => {
+            // Check for RST before processing
+            if config.raw_mode == RawMode::FakeTcp {
+                // Peek to check for RST flag without consuming
+                if conn_info.raw_info.recv_info.rst {
+                    conn_info.raw_info.rst_received += 1;
+                    if conn_info.raw_info.rst_received > 5 {
+                        log::warn!("too many RST received, reconnecting");
+                        conn_info.state = ConnectionState::Client(ClientState::Idle);
+                        return;
+                    }
+                }
+            }
+
             let packets = match recv_safer_multi(raw_state, conn_info, encryptor, config) {
                 Ok(p) => p,
                 Err(_) => return,
@@ -497,24 +481,26 @@ fn client_on_data_packet(
     config: &Config,
     udp_fd: RawFd,
 ) {
+    let now = get_current_time();
+
     // Transition from Handshake2 to Ready on first valid packet
     if let ConnectionState::Client(ClientState::Handshake2) = conn_info.state {
         conn_info.state = ConnectionState::Client(ClientState::Ready);
         conn_info.last_hb_sent_time = 0;
-        conn_info.last_hb_recv_time = get_current_time();
-        conn_info.last_opposite_roller_time = conn_info.last_hb_recv_time;
+        conn_info.last_hb_recv_time = now;
+        conn_info.last_opposite_roller_time = now;
         log::info!("state -> Ready");
     }
 
     if pkt.pkt_type == b'h' {
-        conn_info.last_hb_recv_time = get_current_time();
+        conn_info.last_hb_recv_time = now;
         log::debug!("heartbeat received");
         return;
     }
 
     if pkt.pkt_type == b'd' && pkt.data.len() >= 4 {
         if config.hb_mode == 0 {
-            conn_info.last_hb_recv_time = get_current_time();
+            conn_info.last_hb_recv_time = now;
         }
 
         let conv_id = u32::from_be_bytes([pkt.data[0], pkt.data[1], pkt.data[2], pkt.data[3]]);
@@ -525,13 +511,12 @@ fn client_on_data_packet(
             None => return,
         };
         if let ConvManagerVariant::Client(ref cm) = blob.conv_manager {
-            if !cm.is_conv_used(conv_id) {
-                log::info!("unknown conv {:x}, ignored", conv_id);
-                return;
-            }
             let addr = match cm.find_data_by_conv(conv_id) {
                 Some(a) => *a,
-                None => return,
+                None => {
+                    log::info!("unknown conv {:x}, ignored", conv_id);
+                    return;
+                }
             };
 
             // Send payload back to the local UDP client
@@ -556,7 +541,7 @@ fn client_on_data_packet(
                     let mut sa: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
                     sa.sin6_family = libc::AF_INET6 as u16;
                     sa.sin6_port = a.port().to_be();
-                    sa.sin6_addr = unsafe { std::mem::transmute(*a.ip()) };
+                    sa.sin6_addr = libc::in6_addr { s6_addr: a.ip().octets() };
                     unsafe {
                         libc::sendto(
                             udp_fd,
@@ -582,7 +567,7 @@ fn client_on_data_packet(
 
 fn client_on_udp_recv(
     conn_info: &mut ConnInfo,
-    raw_state: &mut RawSocketState,
+    raw_state: &mut RawTransport,
     encryptor: &Encryptor,
     config: &Config,
     udp_fd: RawFd,
@@ -625,58 +610,31 @@ fn client_on_udp_recv(
     };
 
     let conv = if let ConvManagerVariant::Client(ref mut cm) = blob.conv_manager {
-        if !cm.is_data_used(&src_addr) {
-            if cm.get_size() >= MAX_CONV_NUM {
-                log::warn!("max conv num exceeded");
-                return;
+        let conv = match cm.find_conv_by_data(&src_addr) {
+            Some(c) => c,
+            None => {
+                if cm.get_size() >= MAX_CONV_NUM {
+                    log::warn!("max conv num exceeded");
+                    return;
+                }
+                let conv = cm.get_new_conv();
+                cm.insert_conv(conv, src_addr);
+                log::info!("new UDP session from {}, conv={:x}", src_addr, conv);
+                conv
             }
-            let conv = cm.get_new_conv();
-            cm.insert_conv(conv, src_addr);
-            log::info!("new UDP session from {}, conv={:x}", src_addr, conv);
-            conv
-        } else {
-            cm.find_conv_by_data(&src_addr).unwrap()
-        }
+        };
+        cm.update_active_time(conv);
+        cm.clear_inactive();
+        conv
     } else {
         return;
     };
-
-    if let ConvManagerVariant::Client(ref mut cm) = blob.conv_manager {
-        cm.update_active_time(conv);
-    }
-
-    // Clear inactive convs
-    if let ConvManagerVariant::Client(ref mut cm) = blob.conv_manager {
-        cm.clear_inactive();
-    }
 
     if let ConnectionState::Client(ClientState::Ready) = conn_info.state {
         let _ = send_data_safer(raw_state, conn_info, &buf[..recv_len], conv, encryptor, config);
     }
 }
 
-fn sockaddr_to_socketaddr(
-    addr: &libc::sockaddr_storage,
-    len: libc::socklen_t,
-) -> Option<SocketAddr> {
-    let family = addr.ss_family as i32;
-    if family == libc::AF_INET && len as usize >= std::mem::size_of::<libc::sockaddr_in>() {
-        let sa: &libc::sockaddr_in = unsafe { &*(addr as *const _ as *const libc::sockaddr_in) };
-        let ip = std::net::Ipv4Addr::from(u32::from_be(sa.sin_addr.s_addr));
-        let port = u16::from_be(sa.sin_port);
-        Some(SocketAddr::new(std::net::IpAddr::V4(ip), port))
-    } else if family == libc::AF_INET6
-        && len as usize >= std::mem::size_of::<libc::sockaddr_in6>()
-    {
-        let sa: &libc::sockaddr_in6 =
-            unsafe { &*(addr as *const _ as *const libc::sockaddr_in6) };
-        let ip: std::net::Ipv6Addr = unsafe { std::mem::transmute(sa.sin6_addr) };
-        let port = u16::from_be(sa.sin6_port);
-        Some(SocketAddr::new(std::net::IpAddr::V6(ip), port))
-    } else {
-        None
-    }
-}
 
 fn create_fifo(path: &str) -> io::Result<RawFd> {
     use std::ffi::CString;

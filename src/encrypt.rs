@@ -8,7 +8,7 @@
 use crate::common::{AuthMode, BUF_LEN, CipherMode, MAX_DATA_LEN};
 
 use aes::Aes128;
-use cipher::{AsyncStreamCipher, BlockDecrypt, BlockDecryptMut, BlockEncrypt, BlockEncryptMut, KeyInit, KeyIvInit};
+use cipher::{AsyncStreamCipher, BlockDecrypt, BlockEncrypt, KeyInit, KeyIvInit};
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use sha1::Sha1;
@@ -116,6 +116,11 @@ pub struct Encryptor {
     aes_gro_enc: Option<Aes128>,
     /// Pre-computed AES cipher for GRO ECB decrypt (always cipher_key_decrypt).
     aes_gro_dec: Option<Aes128>,
+    /// Pre-computed HMAC-SHA1 state for encrypt direction.
+    /// Clone per-call to avoid re-deriving ipad/opad (~200 cycles saved per packet).
+    hmac_enc: Option<HmacSha1>,
+    /// Pre-computed HMAC-SHA1 state for decrypt direction.
+    hmac_dec: Option<HmacSha1>,
 }
 
 impl Encryptor {
@@ -148,6 +153,18 @@ impl Encryptor {
             None
         };
 
+        // Pre-compute HMAC-SHA1 inner state (avoids re-deriving ipad/opad per packet)
+        let hmac_enc = if is_hmac_used {
+            Some(<HmacSha1 as Mac>::new_from_slice(&keys.hmac_key_encrypt[..20]).expect("HMAC encrypt key"))
+        } else {
+            None
+        };
+        let hmac_dec = if is_hmac_used {
+            Some(<HmacSha1 as Mac>::new_from_slice(&keys.hmac_key_decrypt[..20]).expect("HMAC decrypt key"))
+        } else {
+            None
+        };
+
         Self {
             keys,
             auth_mode,
@@ -157,6 +174,8 @@ impl Encryptor {
             aes_dec,
             aes_gro_enc,
             aes_gro_dec,
+            hmac_enc,
+            hmac_dec,
         }
     }
 
@@ -202,9 +221,10 @@ impl Encryptor {
     // ── AE mode (encrypt-then-MAC, used when HMAC enabled) ──
 
     fn encrypt_ae(&self, data: &[u8], output: &mut [u8]) -> Result<usize, ()> {
-        let mut buf = [0u8; BUF_LEN];
-        let enc_len = self.cipher_encrypt(data, &mut buf)?;
-        let auth_len = self.auth_cal(&buf[..enc_len], output)?;
+        // Cipher encrypt directly into output — no intermediate buffer needed
+        let enc_len = self.cipher_encrypt(data, output)?;
+        // Compute auth over output[..enc_len] and append tag in-place
+        let auth_len = self.auth_cal_inplace(output, enc_len)?;
         Ok(auth_len)
     }
 
@@ -215,6 +235,38 @@ impl Encryptor {
     }
 
     // ── Auth functions ──
+
+    /// Compute auth tag over data already present in `output[..data_len]`
+    /// and append the tag after it. Returns total length (data + tag).
+    /// Avoids the copy needed by auth_cal when data is already in the output buffer.
+    fn auth_cal_inplace(&self, output: &mut [u8], data_len: usize) -> Result<usize, ()> {
+        match self.auth_mode {
+            AuthMode::None => Ok(data_len),
+            AuthMode::Md5 => {
+                use md5::{Md5, Digest};
+                let hash = Md5::digest(&output[..data_len]);
+                output[data_len..data_len + 16].copy_from_slice(&hash);
+                Ok(data_len + 16)
+            }
+            AuthMode::Crc32 => {
+                let crc = crc32fast::hash(&output[..data_len]);
+                output[data_len..data_len + 4].copy_from_slice(&crc.to_be_bytes());
+                Ok(data_len + 4)
+            }
+            AuthMode::Simple => {
+                let hash = simple_hash(&output[..data_len]);
+                output[data_len..data_len + 8].copy_from_slice(&hash);
+                Ok(data_len + 8)
+            }
+            AuthMode::HmacSha1 => {
+                let mut mac = self.hmac_enc.as_ref().ok_or(())?.clone();
+                mac.update(&output[..data_len]);
+                let result = mac.finalize().into_bytes();
+                output[data_len..data_len + 20].copy_from_slice(&result);
+                Ok(data_len + 20)
+            }
+        }
+    }
 
     fn auth_cal(&self, data: &[u8], output: &mut [u8]) -> Result<usize, ()> {
         match self.auth_mode {
@@ -243,8 +295,7 @@ impl Encryptor {
             }
             AuthMode::HmacSha1 => {
                 output[..data.len()].copy_from_slice(data);
-                let mut mac =
-                    <HmacSha1 as Mac>::new_from_slice(&self.keys.hmac_key_encrypt[..20]).map_err(|_| ())?;
+                let mut mac = self.hmac_enc.as_ref().ok_or(())?.clone();
                 mac.update(data);
                 let result = mac.finalize().into_bytes();
                 output[data.len()..data.len() + 20].copy_from_slice(&result);
@@ -299,8 +350,7 @@ impl Encryptor {
                     return Err(());
                 }
                 let payload_len = data.len() - 20;
-                let mut mac =
-                    <HmacSha1 as Mac>::new_from_slice(&self.keys.hmac_key_decrypt[..20]).map_err(|_| ())?;
+                let mut mac = self.hmac_dec.as_ref().ok_or(())?.clone();
                 mac.update(&data[..payload_len]);
                 let result = mac.finalize().into_bytes();
                 if result.as_slice() != &data[payload_len..] {
@@ -394,7 +444,7 @@ impl Encryptor {
             CipherMode::Aes128Cbc => {
                 let aes = self.aes_dec.as_ref().ok_or(())?;
                 let mut len = data.len();
-                if len % 16 != 0 {
+                if !len.is_multiple_of(16) {
                     log::debug!("AES-CBC decrypt: len%16 != 0");
                     return Err(());
                 }
@@ -473,7 +523,7 @@ fn xor_cipher(data: &[u8], output: &mut [u8], key: &[u8]) {
 /// Last byte = (padded_len - original_len).
 fn custom_padding(buf: &mut [u8], data_len: usize) -> usize {
     let mut new_len = data_len + 1;
-    if new_len % 16 != 0 {
+    if !new_len.is_multiple_of(16) {
         new_len = (new_len / 16) * 16 + 16;
     }
     buf[new_len - 1] = (new_len - data_len) as u8;

@@ -3,13 +3,12 @@
 //! Encapsulates UDP traffic into FakeTCP/UDP/ICMP packets using raw sockets.
 //! Wire-compatible with the original C++ udp2raw implementation.
 
-#![allow(dead_code)]
-#![allow(unused_imports)]
 
 use udp2raw::common::*;
 use udp2raw::encrypt::{EncryptionKeys, Encryptor};
-use udp2raw::misc::{self, Config};
+use udp2raw::misc;
 use udp2raw::network::RawSocketState;
+use udp2raw::transport::RawTransport;
 use udp2raw::{client, logging, server};
 
 fn main() {
@@ -59,29 +58,8 @@ fn main() {
         std::process::exit(0);
     }
 
-    // Initialize raw sockets — dispatch based on XDP feature/config
-    #[cfg(feature = "xdp")]
-    let mut raw_state = if config.xdp_enabled {
-        let ebpf_bytes = include_bytes!(concat!(env!("OUT_DIR"), "/udp2raw-ebpf"));
-        RawSocketState::init_xdp(&config, ebpf_bytes).unwrap_or_else(|e| {
-            log::error!("AF_XDP init failed: {}", e);
-            log::error!("hint: requires CAP_NET_ADMIN+CAP_BPF, kernel ≥4.18, NIC with XDP support");
-            std::process::exit(-1);
-        })
-    } else {
-        RawSocketState::init(&config).unwrap_or_else(|e| {
-            log::error!("raw socket init failed: {}", e);
-            log::error!("hint: run as root or with CAP_NET_RAW capability");
-            std::process::exit(-1);
-        })
-    };
-
-    #[cfg(not(feature = "xdp"))]
-    let mut raw_state = RawSocketState::init(&config).unwrap_or_else(|e| {
-        log::error!("raw socket init failed: {}", e);
-        log::error!("hint: run as root or with CAP_NET_RAW capability");
-        std::process::exit(-1);
-    });
+    // Initialize transport (raw sockets or AF_XDP)
+    let mut transport = init_transport(&config);
 
     // Setup iptables rules (auto-add)
     let mut _iptables: Option<misc::IptablesManager> = None;
@@ -102,10 +80,10 @@ fn main() {
     // Run event loop
     let result = match config.program_mode {
         ProgramMode::Client => {
-            client::client_event_loop(&config, &encryptor, &mut raw_state, const_id)
+            client::client_event_loop(&config, &encryptor, &mut transport, const_id)
         }
         ProgramMode::Server => {
-            server::server_event_loop(&config, &encryptor, &mut raw_state, const_id)
+            server::server_event_loop(&config, &encryptor, &mut transport, const_id)
         }
         ProgramMode::Unset => {
             log::error!("program mode not set");
@@ -132,3 +110,31 @@ extern "C" fn signal_handler(_sig: libc::c_int) {
     // Graceful exit — iptables cleanup happens via Drop
     std::process::exit(0);
 }
+
+fn init_transport(config: &misc::Config) -> RawTransport {
+    #[cfg(feature = "xdp")]
+    if config.xdp_enabled {
+        log::info!("using AF_XDP transport");
+        let xdp_state = udp2raw::xdp::XdpSocketState::init(config).unwrap_or_else(|e| {
+            log::error!("AF_XDP init failed: {}", e);
+            log::error!("hint: requires Linux >= 5.7, CAP_NET_ADMIN + CAP_NET_RAW, and --dev <interface>");
+            std::process::exit(-1);
+        });
+        return RawTransport::Xdp(xdp_state);
+    }
+
+    #[cfg(not(feature = "xdp"))]
+    if config.xdp_enabled {
+        log::error!("AF_XDP not available: recompile with --features xdp");
+        std::process::exit(-1);
+    }
+
+    log::info!("using raw socket transport");
+    let raw_state = RawSocketState::init(config).unwrap_or_else(|e| {
+        log::error!("raw socket init failed: {}", e);
+        log::error!("hint: run as root or with CAP_NET_RAW capability");
+        std::process::exit(-1);
+    });
+    RawTransport::Socket(raw_state)
+}
+

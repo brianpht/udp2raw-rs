@@ -4,7 +4,7 @@
 use crate::common::*;
 use crate::misc::Config;
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::os::unix::io::RawFd;
 
 // ─── Packet header structs ──────────────────────────────────────────────────
@@ -228,7 +228,7 @@ impl Default for PacketInfo {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct RawInfo {
     pub send_info: PacketInfo,
     pub recv_info: PacketInfo,
@@ -238,18 +238,6 @@ pub struct RawInfo {
     pub disabled: bool,
 }
 
-impl Default for RawInfo {
-    fn default() -> Self {
-        Self {
-            send_info: PacketInfo::default(),
-            recv_info: PacketInfo::default(),
-            peek: false,
-            reserved_send_seq: 0,
-            rst_received: 0,
-            disabled: false,
-        }
-    }
-}
 
 // ─── Raw socket state ───────────────────────────────────────────────────────
 
@@ -266,8 +254,7 @@ pub struct RawSocketState {
     pub g_packet_buf: Vec<u8>,
     pub g_packet_buf_len: i32,
     pub lower_level: bool,
-    #[cfg(feature = "xdp")]
-    pub xdp: Option<crate::xdp::XdpState>,
+    pub is_client: bool,
 }
 
 impl RawSocketState {
@@ -340,56 +327,64 @@ impl RawSocketState {
             g_packet_buf: vec![0u8; HUGE_BUF_LEN],
             g_packet_buf_len: -1,
             lower_level: config.lower_level_enabled,
-            #[cfg(feature = "xdp")]
-            xdp: None,
+            is_client: config.program_mode == ProgramMode::Client,
         })
     }
 
-    /// Initialize `RawSocketState` with AF_XDP transport instead of raw sockets.
-    ///
-    /// The XSK socket fd is used as `raw_recv_fd` so the existing mio
-    /// registration in client/server event loops works unchanged.
-    #[cfg(feature = "xdp")]
-    pub fn init_xdp(config: &Config, ebpf_bytes: &[u8]) -> io::Result<Self> {
-        let xdp = crate::xdp::XdpState::init(
-            ebpf_bytes,
-            &config.xdp_ifname,
-            config.xdp_queue_id,
-            config.xdp_zerocopy,
-            config.xdp_dst_mac,
-        )?;
-        let recv_fd = xdp.xsk.fd(); // pollable fd for mio
-
-        Ok(Self {
-            raw_recv_fd: recv_fd,
-            raw_send_fd: recv_fd,
-            filter_port: -1,
-            seq_mode: config.seq_mode,
-            ip_id_counter: 0,
-            g_packet_buf: vec![0u8; HUGE_BUF_LEN],
-            g_packet_buf_len: -1,
-            lower_level: false,
-            xdp: Some(xdp),
-        })
-    }
 
     /// Attach BPF filter for the specified port.
+    /// Generates and attaches a BPF program to the raw recv socket to filter
+    /// only the protocol and port we're interested in, matching C++ gen_bpf_filter.
     pub fn init_filter(&mut self, port: u16, config: &Config) {
-        #[cfg(feature = "xdp")]
-        if self.xdp.is_some() {
-            log::info!("XDP mode: BPF filter handled by eBPF program");
-            return;
-        }
 
         if config.disable_bpf_filter {
             return;
         }
         self.filter_port = port as i32;
 
-        // Build BPF filter for the specified raw_mode and port
-        // This is a simplified version; the C++ code generates complex BPF programs
-        // For now, we set the filter port and rely on userspace filtering
-        log::info!("BPF filter set for port {}", port);
+        // Build BPF filter instructions based on raw_mode.
+        //
+        // For raw sockets (not AF_PACKET), the BPF program sees the full IP packet
+        // starting at the IP header. Offsets:
+        //   byte 0: version_ihl
+        //   byte 9: protocol
+        //   IP header length: (byte[0] & 0x0f) * 4
+        //
+        // FakeTCP: ip[9] == 6 (TCP), dst_port at IP_hdr_len + 2 matches port
+        // UDP:     ip[9] == 17 (UDP), dst_port at IP_hdr_len + 2 matches port
+        // ICMP:    ip[9] == 1 (ICMP), icmp type at IP_hdr_len + 0 matches expected type
+
+        let filter = match config.raw_mode {
+            RawMode::FakeTcp => build_bpf_filter_tcp(port, config.program_mode),
+            RawMode::Udp => build_bpf_filter_udp(port, config.program_mode),
+            RawMode::Icmp => build_bpf_filter_icmp(config.program_mode),
+        };
+
+        if filter.is_empty() {
+            log::warn!("BPF filter generation failed, running without filter");
+            return;
+        }
+
+        let fprog = libc::sock_fprog {
+            len: filter.len() as u16,
+            filter: filter.as_ptr() as *mut libc::sock_filter,
+        };
+
+        let ret = unsafe {
+            libc::setsockopt(
+                self.raw_recv_fd,
+                libc::SOL_SOCKET,
+                libc::SO_ATTACH_FILTER,
+                &fprog as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::sock_fprog>() as libc::socklen_t,
+            )
+        };
+
+        if ret < 0 {
+            log::warn!("BPF filter attach failed: {}", std::io::Error::last_os_error());
+        } else {
+            log::info!("BPF filter attached for port {} ({})", port, config.raw_mode);
+        }
     }
 
     /// Send a raw IP packet.
@@ -421,12 +416,6 @@ impl RawSocketState {
                 packet[..20].copy_from_slice(iph.as_bytes());
                 packet[20..20 + payload.len()].copy_from_slice(payload);
 
-                // ── XDP path: prepend Ethernet header, write to TX ring ──
-                #[cfg(feature = "xdp")]
-                if let Some(ref mut xdp) = self.xdp {
-                    xdp.send_ip_packet(&packet[..ip_payload_len], 0x0800)?;
-                    return Ok(ip_payload_len);
-                }
 
                 // Send
                 let dst_addr = libc::sockaddr_in {
@@ -461,29 +450,9 @@ impl RawSocketState {
         }
     }
 
-    /// Receive a raw IP packet. Returns (payload_data, payload_len).
-    pub fn recv_raw_ip(&mut self, raw_info: &mut RawInfo) -> io::Result<Vec<u8>> {
-        // ── XDP path: read L2 frame, strip Ethernet, parse IP ──
-        #[cfg(feature = "xdp")]
-        if let Some(ref mut xdp) = self.xdp {
-            let (ethertype, ip_data) = xdp.recv_ip_packet()?;
-            if ethertype != 0x0800 {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "non-IPv4"));
-            }
-            if ip_data.len() < 20 {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "packet too short"));
-            }
-            let ihl = (ip_data[0] & 0x0F) as usize * 4;
-            if ip_data.len() < ihl {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "IP header truncated"));
-            }
-            let saddr = u32::from_be_bytes([ip_data[12], ip_data[13], ip_data[14], ip_data[15]]);
-            let daddr = u32::from_be_bytes([ip_data[16], ip_data[17], ip_data[18], ip_data[19]]);
-            raw_info.recv_info.src_ip = IpAddr::V4(Ipv4Addr::from(saddr));
-            raw_info.recv_info.dst_ip = IpAddr::V4(Ipv4Addr::from(daddr));
-            raw_info.recv_info.protocol = ip_data[9];
-            return Ok(ip_data[ihl..].to_vec());
-        }
+    /// Receive a raw IP packet. Returns `(ihl, recv_len)` — the IP payload is
+    /// at `self.g_packet_buf[ihl..recv_len]`. Zero-copy: no heap allocation.
+    fn recv_raw_ip_offsets(&mut self, raw_info: &mut RawInfo) -> io::Result<(usize, usize)> {
 
         // Use pre-allocated g_packet_buf instead of allocating 65KB per call
         let mut addr: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
@@ -527,9 +496,7 @@ impl RawSocketState {
             raw_info.recv_info.dst_ip = IpAddr::V4(Ipv4Addr::from(daddr));
             raw_info.recv_info.protocol = protocol;
 
-            // Only allocate for the actual payload size (typically ~1-2KB), not the full 65KB buffer
-            let payload = self.g_packet_buf[ihl..recv_len].to_vec();
-            Ok(payload)
+            Ok((ihl, recv_len))
         } else {
             Err(io::Error::new(io::ErrorKind::Unsupported, "non-IPv4"))
         }
@@ -537,12 +504,6 @@ impl RawSocketState {
 
     /// Discard one pending raw packet.
     pub fn discard_raw_packet(&mut self) {
-        #[cfg(feature = "xdp")]
-        if self.xdp.is_some() {
-            // In XDP mode, consume and discard one frame from the RX ring
-            let _ = self.recv_raw_ip(&mut RawInfo::default());
-            return;
-        }
 
         let mut buf = [0u8; 1];
         unsafe {
@@ -551,6 +512,7 @@ impl RawSocketState {
     }
 
     /// Build and send a FakeTCP packet.
+    /// Includes TCP timestamp option (12 bytes) when `has_ts` is set, matching C++ behavior.
     pub fn send_raw_tcp(
         &mut self,
         raw_info: &mut RawInfo,
@@ -558,8 +520,10 @@ impl RawSocketState {
     ) -> io::Result<usize> {
         let send_info = &raw_info.send_info;
 
-        // Build TCP header using stack buffer (no heap allocation)
-        let tcp_len = 20 + payload.len(); // No TCP options for simplicity (doff=5)
+        // TCP header: 20 bytes base + optional 12-byte timestamp (NOP, NOP, TS val, TS ecr)
+        let has_ts = send_info.has_ts;
+        let tcp_hdr_len: usize = if has_ts { 32 } else { 20 };
+        let tcp_len = tcp_hdr_len + payload.len();
         let mut tcp_buf = [0u8; SEND_BUF_SIZE];
 
         let mut tcph = TcpHeader::default();
@@ -567,7 +531,7 @@ impl RawSocketState {
         tcph.dest = send_info.dst_port.to_be();
         tcph.seq = send_info.seq.to_be();
         tcph.ack_seq = send_info.ack_seq.to_be();
-        tcph.set_doff(5);
+        tcph.set_doff(if has_ts { 8 } else { 5 });
         tcph.set_flags(false, send_info.syn, false, send_info.psh, send_info.ack);
         tcph.window = 65535u16.to_be();
         tcph.check = 0;
@@ -576,8 +540,20 @@ impl RawSocketState {
         // Copy TCP header
         let hdr_bytes = tcph.as_bytes();
         tcp_buf[..20].copy_from_slice(hdr_bytes);
+
+        if has_ts {
+            // TCP timestamp option: NOP(1), NOP(1), Timestamp(10)
+            // Kind=8, Length=10, TSval(4), TSecr(4)
+            tcp_buf[20] = 0x01; // NOP
+            tcp_buf[21] = 0x01; // NOP
+            tcp_buf[22] = 0x08; // Timestamp kind
+            tcp_buf[23] = 0x0A; // Timestamp length (10)
+            tcp_buf[24..28].copy_from_slice(&send_info.ts.to_be_bytes());
+            tcp_buf[28..32].copy_from_slice(&send_info.ts_ack.to_be_bytes());
+        }
+
         if !payload.is_empty() {
-            tcp_buf[20..].copy_from_slice(payload);
+            tcp_buf[tcp_hdr_len..tcp_hdr_len + payload.len()].copy_from_slice(payload);
         }
 
         // Compute TCP checksum
@@ -625,16 +601,18 @@ impl RawSocketState {
     }
 
     /// Build and send an ICMP-encapsulated packet.
+    /// `icmp_type`: 8 for echo request (client), 0 for echo reply (server).
     pub fn send_raw_icmp(
         &mut self,
         raw_info: &mut RawInfo,
         payload: &[u8],
+        icmp_type: u8,
     ) -> io::Result<usize> {
         let send_info = &raw_info.send_info;
         let icmp_len = 8 + payload.len();
         let mut icmp_buf = [0u8; SEND_BUF_SIZE];
 
-        icmp_buf[0] = 8; // Echo request
+        icmp_buf[0] = icmp_type;
         icmp_buf[1] = 0; // Code
         icmp_buf[2..4].copy_from_slice(&0u16.to_be_bytes()); // Checksum placeholder
         icmp_buf[4..6].copy_from_slice(&send_info.src_port.to_be_bytes()); // ID
@@ -661,76 +639,149 @@ impl RawSocketState {
         match raw_mode {
             RawMode::FakeTcp => self.send_raw_tcp(raw_info, payload),
             RawMode::Udp => self.send_raw_udp(raw_info, payload),
-            RawMode::Icmp => self.send_raw_icmp(raw_info, payload),
+            RawMode::Icmp => {
+                // Client sends echo request (type 8), server sends echo reply (type 0)
+                let icmp_type = if self.is_client { 8 } else { 0 };
+                self.send_raw_icmp(raw_info, payload, icmp_type)
+            }
         }
     }
 
-    /// Receive and parse a raw packet. Returns payload after protocol header.
+    /// Receive a raw IP packet. Writes IP payload (after IP header) into `output`.
+    /// Returns the number of bytes written to `output`.
+    pub fn recv_raw_ip(&mut self, raw_info: &mut RawInfo, output: &mut [u8]) -> io::Result<usize> {
+
+        let (ihl, recv_len) = self.recv_raw_ip_offsets(raw_info)?;
+
+        // Zero-copy: write directly into caller's output buffer
+        let payload_len = recv_len - ihl;
+        output[..payload_len].copy_from_slice(&self.g_packet_buf[ihl..recv_len]);
+        Ok(payload_len)
+    }
+
+    /// Receive and parse a raw packet. Writes payload after protocol header into `output`.
+    /// Returns the number of bytes written. Zero heap allocations.
     pub fn recv_raw0(
         &mut self,
         raw_info: &mut RawInfo,
         raw_mode: RawMode,
-    ) -> io::Result<Vec<u8>> {
-        let ip_payload = self.recv_raw_ip(raw_info)?;
+        output: &mut [u8],
+    ) -> io::Result<usize> {
+        let (ihl, recv_len) = self.recv_raw_ip_offsets(raw_info)?;
+        // g_packet_buf[ihl..recv_len] is the IP payload — mutable borrow released
+        parse_protocol_payload(&self.g_packet_buf[ihl..recv_len], raw_info, raw_mode, output)
+    }
+}
 
-        match raw_mode {
-            RawMode::FakeTcp => {
-                if ip_payload.len() < 20 {
-                    return Err(io::Error::new(io::ErrorKind::InvalidData, "TCP header truncated"));
-                }
-                // Parse TCP header
-                let src_port = u16::from_be_bytes([ip_payload[0], ip_payload[1]]);
-                let dst_port = u16::from_be_bytes([ip_payload[2], ip_payload[3]]);
-                let seq = u32::from_be_bytes([ip_payload[4], ip_payload[5], ip_payload[6], ip_payload[7]]);
-                let ack_seq = u32::from_be_bytes([ip_payload[8], ip_payload[9], ip_payload[10], ip_payload[11]]);
-                let off_flags = u16::from_be_bytes([ip_payload[12], ip_payload[13]]);
-                let doff = ((off_flags >> 12) & 0x0F) as usize * 4;
-                let flags = (off_flags & 0xFF) as u8;
-
-                raw_info.recv_info.src_port = src_port;
-                raw_info.recv_info.dst_port = dst_port;
-                raw_info.recv_info.seq = seq;
-                raw_info.recv_info.ack_seq = ack_seq;
-                raw_info.recv_info.syn = flags & 0x02 != 0;
-                raw_info.recv_info.ack = flags & 0x10 != 0;
-                raw_info.recv_info.psh = flags & 0x08 != 0;
-                raw_info.recv_info.rst = flags & 0x04 != 0;
-
-                if doff > ip_payload.len() {
-                    return Err(io::Error::new(io::ErrorKind::InvalidData, "TCP doff exceeds packet"));
-                }
-
-                let data = ip_payload[doff..].to_vec();
-                raw_info.recv_info.data_len = data.len() as i32;
-                Ok(data)
+/// Parse protocol headers from an IP payload and extract the application data.
+/// Shared by RawSocketState::recv_raw0 and XdpSocketState::recv_raw0.
+/// Writes the extracted data into `output` and returns the number of bytes written.
+pub fn parse_protocol_payload(
+    ip_payload: &[u8],
+    raw_info: &mut RawInfo,
+    raw_mode: RawMode,
+    output: &mut [u8],
+) -> io::Result<usize> {
+    match raw_mode {
+        RawMode::FakeTcp => {
+            if ip_payload.len() < 20 {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "TCP header truncated"));
             }
-            RawMode::Udp => {
-                if ip_payload.len() < 8 {
-                    return Err(io::Error::new(io::ErrorKind::InvalidData, "UDP header truncated"));
-                }
-                let src_port = u16::from_be_bytes([ip_payload[0], ip_payload[1]]);
-                let dst_port = u16::from_be_bytes([ip_payload[2], ip_payload[3]]);
-                raw_info.recv_info.src_port = src_port;
-                raw_info.recv_info.dst_port = dst_port;
+            // Parse TCP header
+            let src_port = u16::from_be_bytes([ip_payload[0], ip_payload[1]]);
+            let dst_port = u16::from_be_bytes([ip_payload[2], ip_payload[3]]);
+            let seq = u32::from_be_bytes([ip_payload[4], ip_payload[5], ip_payload[6], ip_payload[7]]);
+            let ack_seq = u32::from_be_bytes([ip_payload[8], ip_payload[9], ip_payload[10], ip_payload[11]]);
+            let off_flags = u16::from_be_bytes([ip_payload[12], ip_payload[13]]);
+            let doff = ((off_flags >> 12) & 0x0F) as usize * 4;
+            let flags = (off_flags & 0xFF) as u8;
 
-                let data = ip_payload[8..].to_vec();
-                raw_info.recv_info.data_len = data.len() as i32;
-                Ok(data)
-            }
-            RawMode::Icmp => {
-                if ip_payload.len() < 8 {
-                    return Err(io::Error::new(io::ErrorKind::InvalidData, "ICMP header truncated"));
-                }
-                let id = u16::from_be_bytes([ip_payload[4], ip_payload[5]]);
-                let seq = u16::from_be_bytes([ip_payload[6], ip_payload[7]]);
-                raw_info.recv_info.src_port = id;
-                raw_info.recv_info.dst_port = id;
-                raw_info.recv_info.my_icmp_seq = seq;
+            raw_info.recv_info.src_port = src_port;
+            raw_info.recv_info.dst_port = dst_port;
+            raw_info.recv_info.seq = seq;
+            raw_info.recv_info.ack_seq = ack_seq;
+            raw_info.recv_info.syn = flags & 0x02 != 0;
+            raw_info.recv_info.ack = flags & 0x10 != 0;
+            raw_info.recv_info.psh = flags & 0x08 != 0;
+            raw_info.recv_info.rst = flags & 0x04 != 0;
 
-                let data = ip_payload[8..].to_vec();
-                raw_info.recv_info.data_len = data.len() as i32;
-                Ok(data)
+            // Parse TCP timestamp option (NOP, NOP, Kind=8, Len=10, TSval, TSecr)
+            raw_info.recv_info.has_ts = false;
+            if doff > 20 && ip_payload.len() >= doff {
+                let mut opt_offset = 20;
+                while opt_offset < doff {
+                    let kind = ip_payload[opt_offset];
+                    if kind == 0 {
+                        break; // End of options
+                    }
+                    if kind == 1 {
+                        opt_offset += 1; // NOP
+                        continue;
+                    }
+                    if opt_offset + 1 >= doff {
+                        break;
+                    }
+                    let opt_len = ip_payload[opt_offset + 1] as usize;
+                    if opt_len < 2 || opt_offset + opt_len > doff {
+                        break;
+                    }
+                    if kind == 8 && opt_len == 10 && opt_offset + 10 <= doff {
+                        // Timestamp option
+                        raw_info.recv_info.ts = u32::from_be_bytes([
+                            ip_payload[opt_offset + 2],
+                            ip_payload[opt_offset + 3],
+                            ip_payload[opt_offset + 4],
+                            ip_payload[opt_offset + 5],
+                        ]);
+                        raw_info.recv_info.ts_ack = u32::from_be_bytes([
+                            ip_payload[opt_offset + 6],
+                            ip_payload[opt_offset + 7],
+                            ip_payload[opt_offset + 8],
+                            ip_payload[opt_offset + 9],
+                        ]);
+                        raw_info.recv_info.has_ts = true;
+                    }
+                    opt_offset += opt_len;
+                }
             }
+
+            if doff > ip_payload.len() {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "TCP doff exceeds packet"));
+            }
+
+            let data_len = ip_payload.len() - doff;
+            output[..data_len].copy_from_slice(&ip_payload[doff..]);
+            raw_info.recv_info.data_len = data_len as i32;
+            Ok(data_len)
+        }
+        RawMode::Udp => {
+            if ip_payload.len() < 8 {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "UDP header truncated"));
+            }
+            let src_port = u16::from_be_bytes([ip_payload[0], ip_payload[1]]);
+            let dst_port = u16::from_be_bytes([ip_payload[2], ip_payload[3]]);
+            raw_info.recv_info.src_port = src_port;
+            raw_info.recv_info.dst_port = dst_port;
+
+            let data_len = ip_payload.len() - 8;
+            output[..data_len].copy_from_slice(&ip_payload[8..]);
+            raw_info.recv_info.data_len = data_len as i32;
+            Ok(data_len)
+        }
+        RawMode::Icmp => {
+            if ip_payload.len() < 8 {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "ICMP header truncated"));
+            }
+            let id = u16::from_be_bytes([ip_payload[4], ip_payload[5]]);
+            let seq = u16::from_be_bytes([ip_payload[6], ip_payload[7]]);
+            raw_info.recv_info.src_port = id;
+            raw_info.recv_info.dst_port = id;
+            raw_info.recv_info.my_icmp_seq = seq;
+
+            let data_len = ip_payload.len() - 8;
+            output[..data_len].copy_from_slice(&ip_payload[8..]);
+            raw_info.recv_info.data_len = data_len as i32;
+            Ok(data_len)
         }
     }
 }
@@ -811,30 +862,171 @@ pub fn get_src_address(remote: &SocketAddr) -> io::Result<IpAddr> {
 }
 
 /// Update seq/ack after sending (matching C++ after_send_raw0).
+/// seq_mode: 0=noop, 1=increase by data_len, 2=increase by random, 3=real-seq, 4=noop (handled by timer)
 pub fn after_send_raw0(raw_info: &mut RawInfo, seq_mode: u32) {
-    if seq_mode == 0 {
-        return;
-    }
-    // Simplified: increment seq by data_len
-    if raw_info.send_info.data_len > 0 {
-        raw_info.send_info.seq = raw_info
-            .send_info
-            .seq
-            .wrapping_add(raw_info.send_info.data_len as u32);
+    match seq_mode {
+        0 | 4 => {
+            // mode 0: don't increase seq at all
+            // mode 4: seq is updated by periodic timer, not per-packet
+        }
+        1 => {
+            // mode 1: increase seq by data_len
+            if raw_info.send_info.data_len > 0 {
+                raw_info.send_info.seq = raw_info
+                    .send_info
+                    .seq
+                    .wrapping_add(raw_info.send_info.data_len as u32);
+            }
+        }
+        2 => {
+            // mode 2: increase seq by a random amount (1..=100)
+            let r = (get_true_random_number() % 100).wrapping_add(1);
+            raw_info.send_info.seq = raw_info.send_info.seq.wrapping_add(r);
+        }
+        3 => {
+            // mode 3 (real seq mode): increase seq by data_len, ack follows recv
+            if raw_info.send_info.data_len > 0 {
+                raw_info.send_info.seq = raw_info
+                    .send_info
+                    .seq
+                    .wrapping_add(raw_info.send_info.data_len as u32);
+            }
+        }
+        _ => {
+            // Unknown mode — treat like mode 0
+        }
     }
 }
 
 /// Update seq/ack after receiving (matching C++ after_recv_raw0).
+/// seq_mode: 0=noop, 1=update ack, 2=noop, 3=real-seq (update ack), 4=noop
 pub fn after_recv_raw0(raw_info: &mut RawInfo, seq_mode: u32) {
-    if seq_mode == 0 {
-        return;
-    }
-    // Update ack to reflect received data
-    if raw_info.recv_info.data_len > 0 {
-        raw_info.send_info.ack_seq = raw_info
-            .recv_info
-            .seq
-            .wrapping_add(raw_info.recv_info.data_len as u32);
+    match seq_mode {
+        0 | 2 | 4 => {
+            // No ack update for these modes
+        }
+        1 => {
+            // mode 1: ack = recv_seq + data_len
+            if raw_info.recv_info.data_len > 0 {
+                raw_info.send_info.ack_seq = raw_info
+                    .recv_info
+                    .seq
+                    .wrapping_add(raw_info.recv_info.data_len as u32);
+            }
+        }
+        3 => {
+            // mode 3 (real seq mode): ack = recv_seq + data_len, track ts
+            if raw_info.recv_info.data_len > 0 {
+                raw_info.send_info.ack_seq = raw_info
+                    .recv_info
+                    .seq
+                    .wrapping_add(raw_info.recv_info.data_len as u32);
+            }
+            if raw_info.recv_info.has_ts {
+                raw_info.send_info.ts_ack = raw_info.recv_info.ts;
+            }
+        }
+        _ => {
+            // Unknown mode — treat like mode 0
+        }
     }
 }
+
+// ─── BPF filter builders ────────────────────────────────────────────────────
+
+/// BPF instruction helper: creates a libc::sock_filter
+#[inline]
+fn bpf_stmt(code: u16, k: u32) -> libc::sock_filter {
+    libc::sock_filter { code, jt: 0, jf: 0, k }
+}
+
+#[inline]
+fn bpf_jump(code: u16, k: u32, jt: u8, jf: u8) -> libc::sock_filter {
+    libc::sock_filter { code, jt, jf, k }
+}
+
+// BPF opcodes
+const BPF_LD: u16 = 0x00;
+const BPF_ABS: u16 = 0x20;
+const BPF_B: u16 = 0x10;
+const BPF_H: u16 = 0x08;
+const BPF_JMP: u16 = 0x05;
+const BPF_JEQ: u16 = 0x10;
+const BPF_RET: u16 = 0x06;
+const BPF_K: u16 = 0x00;
+const BPF_MSH: u16 = 0xa0;
+const BPF_LDX: u16 = 0x01;
+const BPF_IND: u16 = 0x40;
+
+/// Build BPF filter for FakeTCP mode.
+/// Matches: ip[9] == 6 (TCP) && tcp.dport/sport == port
+fn build_bpf_filter_tcp(port: u16, mode: ProgramMode) -> Vec<libc::sock_filter> {
+    let port32 = port as u32;
+    // For client: filter on source port (server sends from its port)
+    // For server: filter on destination port (client sends to our port)
+    let port_offset: u32 = match mode {
+        ProgramMode::Client => 0, // tcp.sport (offset 0 from TCP header start)
+        _ => 2,                    // tcp.dport (offset 2 from TCP header start)
+    };
+
+    vec![
+        // Load ip protocol byte at offset 9
+        bpf_stmt(BPF_LD | BPF_B | BPF_ABS, 9),
+        // If protocol != TCP (6), reject
+        bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, 6, 0, 4),
+        // Load IHL (IP header length) for index register
+        bpf_stmt(BPF_LDX | BPF_B | BPF_MSH, 0),
+        // Load tcp port at IHL + port_offset as u16
+        bpf_stmt(BPF_LD | BPF_H | BPF_IND, port_offset),
+        // If port matches, accept
+        bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, port32, 0, 1),
+        // Accept (return max length)
+        bpf_stmt(BPF_RET | BPF_K, 0xFFFFFFFF),
+        // Reject
+        bpf_stmt(BPF_RET | BPF_K, 0),
+    ]
+}
+
+/// Build BPF filter for UDP raw mode.
+/// Matches: ip[9] == 17 (UDP) && udp.dport/sport == port
+fn build_bpf_filter_udp(port: u16, mode: ProgramMode) -> Vec<libc::sock_filter> {
+    let port32 = port as u32;
+    let port_offset: u32 = match mode {
+        ProgramMode::Client => 0, // udp.sport
+        _ => 2,                    // udp.dport
+    };
+
+    vec![
+        bpf_stmt(BPF_LD | BPF_B | BPF_ABS, 9),
+        bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, 17, 0, 4),
+        bpf_stmt(BPF_LDX | BPF_B | BPF_MSH, 0),
+        bpf_stmt(BPF_LD | BPF_H | BPF_IND, port_offset),
+        bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, port32, 0, 1),
+        bpf_stmt(BPF_RET | BPF_K, 0xFFFFFFFF),
+        bpf_stmt(BPF_RET | BPF_K, 0),
+    ]
+}
+
+/// Build BPF filter for ICMP raw mode.
+/// Matches: ip[9] == 1 (ICMP) && icmp.type matches expected direction.
+/// Server expects echo request (type 8), client expects echo reply (type 0).
+fn build_bpf_filter_icmp(mode: ProgramMode) -> Vec<libc::sock_filter> {
+    let expected_type: u32 = match mode {
+        ProgramMode::Client => 0, // echo reply
+        _ => 8,                    // echo request
+    };
+
+    vec![
+        bpf_stmt(BPF_LD | BPF_B | BPF_ABS, 9),
+        bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, 1, 0, 4),
+        bpf_stmt(BPF_LDX | BPF_B | BPF_MSH, 0),
+        // ICMP type is first byte of ICMP header (offset 0 from IP header end)
+        bpf_stmt(BPF_LD | BPF_B | BPF_IND, 0),
+        bpf_jump(BPF_JMP | BPF_JEQ | BPF_K, expected_type, 0, 1),
+        bpf_stmt(BPF_RET | BPF_K, 0xFFFFFFFF),
+        bpf_stmt(BPF_RET | BPF_K, 0),
+    ]
+}
+
+
 

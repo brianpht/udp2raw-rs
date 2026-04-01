@@ -17,6 +17,12 @@ pub struct FdManager {
     fd_info: HashMap<Fd64, FdInfo>,
 }
 
+impl Default for FdManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl FdManager {
     pub fn new() -> Self {
         // Start counter above u32::MAX to distinguish from raw fds

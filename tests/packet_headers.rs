@@ -326,3 +326,113 @@ fn seq_wrapping_behavior() {
     assert_eq!(ri.send_info.seq, 49);
 }
 
+// ─── seq_mode variant tests ────────────────────────────────────────────────
+
+#[test]
+fn after_send_raw0_mode2_random_increment() {
+    let mut ri = RawInfo::default();
+    ri.send_info.seq = 1000;
+    ri.send_info.data_len = 100;
+
+    after_send_raw0(&mut ri, 2); // seq_mode=2 → random increment
+
+    // seq should have changed (random increment 1..=100)
+    assert_ne!(ri.send_info.seq, 1000);
+    let diff = ri.send_info.seq.wrapping_sub(1000);
+    assert!(diff >= 1 && diff <= 100, "random increment should be 1..=100, got {}", diff);
+}
+
+#[test]
+fn after_send_raw0_mode3_increases_by_datalen() {
+    let mut ri = RawInfo::default();
+    ri.send_info.seq = 1000;
+    ri.send_info.data_len = 200;
+
+    after_send_raw0(&mut ri, 3); // seq_mode=3 → real seq
+
+    assert_eq!(ri.send_info.seq, 1200);
+}
+
+#[test]
+fn after_send_raw0_mode4_noop() {
+    let mut ri = RawInfo::default();
+    ri.send_info.seq = 1000;
+    ri.send_info.data_len = 100;
+
+    after_send_raw0(&mut ri, 4); // seq_mode=4 → noop (timer-based)
+
+    assert_eq!(ri.send_info.seq, 1000);
+}
+
+#[test]
+fn after_recv_raw0_mode2_noop() {
+    let mut ri = RawInfo::default();
+    ri.recv_info.seq = 5000;
+    ri.recv_info.data_len = 200;
+
+    after_recv_raw0(&mut ri, 2); // seq_mode=2 → no ack update
+
+    assert_eq!(ri.send_info.ack_seq, 0);
+}
+
+#[test]
+fn after_recv_raw0_mode3_updates_ack_and_ts() {
+    let mut ri = RawInfo::default();
+    ri.recv_info.seq = 5000;
+    ri.recv_info.data_len = 200;
+    ri.recv_info.has_ts = true;
+    ri.recv_info.ts = 0x12345678;
+
+    after_recv_raw0(&mut ri, 3); // seq_mode=3 → update ack + ts
+
+    assert_eq!(ri.send_info.ack_seq, 5200);
+    assert_eq!(ri.send_info.ts_ack, 0x12345678);
+}
+
+#[test]
+fn after_recv_raw0_mode4_noop() {
+    let mut ri = RawInfo::default();
+    ri.recv_info.seq = 5000;
+    ri.recv_info.data_len = 200;
+
+    after_recv_raw0(&mut ri, 4);
+
+    assert_eq!(ri.send_info.ack_seq, 0);
+}
+
+// ─── TCP timestamp option tests ─────────────────────────────────────────────
+
+#[test]
+fn tcp_timestamp_option_format() {
+    // Verify TCP timestamp option byte layout: NOP, NOP, Kind=8, Len=10, TSval(4), TSecr(4)
+    let ts_val: u32 = 0x12345678;
+    let ts_ecr: u32 = 0xAABBCCDD;
+
+    let mut option_buf = [0u8; 12];
+    option_buf[0] = 0x01; // NOP
+    option_buf[1] = 0x01; // NOP
+    option_buf[2] = 0x08; // Timestamp kind
+    option_buf[3] = 0x0A; // Timestamp length (10)
+    option_buf[4..8].copy_from_slice(&ts_val.to_be_bytes());
+    option_buf[8..12].copy_from_slice(&ts_ecr.to_be_bytes());
+
+    // Parse back
+    assert_eq!(option_buf[0], 0x01);
+    assert_eq!(option_buf[1], 0x01);
+    assert_eq!(option_buf[2], 0x08);
+    assert_eq!(option_buf[3], 0x0A);
+    let parsed_val = u32::from_be_bytes([option_buf[4], option_buf[5], option_buf[6], option_buf[7]]);
+    let parsed_ecr = u32::from_be_bytes([option_buf[8], option_buf[9], option_buf[10], option_buf[11]]);
+    assert_eq!(parsed_val, ts_val);
+    assert_eq!(parsed_ecr, ts_ecr);
+}
+
+#[test]
+fn tcp_header_with_timestamp_is_32_bytes() {
+    // TCP header (20 bytes) + timestamp option (12 bytes) = 32 bytes
+    // doff = 8 (32 / 4)
+    let mut tcph = TcpHeader::default();
+    tcph.set_doff(8);
+    assert_eq!(tcph.doff(), 8);
+    assert_eq!(tcph.doff() as usize * 4, 32);
+}

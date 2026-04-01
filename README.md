@@ -17,6 +17,7 @@ This is a byte-for-byte compatible reimplementation of the original C++ [udp2raw
 - **Anti-Replay**: Sliding window (4000 packets) to reject duplicate/replayed packets
 - **Auto iptables**: Automatically manages firewall rules to prevent kernel RST interference
 - **Lower-Level Mode**: Send at OSI Layer 2 via `AF_PACKET` for environments without raw socket IP access
+- **AF_XDP Transport**: Optional high-performance kernel-bypass I/O via AF_XDP (compile with `--features xdp`)
 - **GRO Fix**: Handle NIC Generic Receive Offload that coalesces packets
 - **No async runtime**: Synchronous `mio` event loop with `libc` FFI. No tokio, no threads for I/O
 
@@ -46,6 +47,9 @@ git clone https://github.com/brianpht/udp2raw-rs.git
 cd udp2raw-rs
 cargo build --release
 # Binary at target/release/udp2raw
+
+# With AF_XDP support (Linux >= 5.7):
+cargo build --release --features xdp
 ```
 
 ### Requirements
@@ -94,6 +98,10 @@ Options:
       --sock-buf <KB>       Socket buffer size [default: 1024]
       --conf-file <path>    Load options from config file
       --fifo <path>         FIFO for runtime commands (e.g. "reconnect")
+      --xdp                 Use AF_XDP transport (requires --features xdp)
+      --xdp-queue <N>       AF_XDP NIC queue ID [default: 0]
+      --xdp-dst-mac <mac>   AF_XDP destination MAC (aa:bb:cc:dd:ee:ff)
+      --xdp-if <name>       AF_XDP interface name (defaults to --dev)
 ```
 
 ## Wire Protocol
@@ -152,9 +160,12 @@ src/
 ├── encrypt.rs     AES-CBC/CFB, XOR, HMAC-SHA1, MD5, CRC32, PBKDF2, HKDF
 ├── connection.rs  Wire protocol (send_bare, send_safer), anti-replay, conv manager
 ├── network.rs     Raw socket I/O, #[repr(C,packed)] IP/TCP/UDP/ICMP headers, BPF
+├── transport.rs   RawTransport enum — dispatches to raw socket or AF_XDP backend
+├── xdp.rs         AF_XDP (kernel-bypass) transport (feature-gated: --features xdp)
 ├── client.rs      Client event loop (mio::Poll + raw fd + UDP fd + timerfd)
 ├── server.rs      Server event loop (mio::Poll + raw fd + per-conn UDP fds)
 ├── fd_manager.rs  Fd64 abstraction to avoid OS fd-reuse collisions
+├── mio_fd.rs      Shared MioFdSource wrapper for mio::Poll registration
 └── logging.rs     Custom logger with timestamps and color
 ```
 

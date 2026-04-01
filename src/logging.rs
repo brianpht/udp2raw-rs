@@ -45,6 +45,28 @@ pub fn get_log_level() -> u8 {
 
 // ─── Logger implementation ─────────────────────────────────────────────────
 
+/// Format current local time as "YYYY-MM-DD HH:MM:SS" using libc (Linux-only).
+/// Uses a stack buffer — zero heap allocations per log call.
+fn format_local_time(buf: &mut [u8; 19]) {
+    let mut tv: libc::timeval = unsafe { std::mem::zeroed() };
+    unsafe { libc::gettimeofday(&mut tv, std::ptr::null_mut()) };
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    unsafe { libc::localtime_r(&tv.tv_sec, &mut tm) };
+    // "YYYY-MM-DD HH:MM:SS" is exactly 19 bytes
+    use std::io::Write;
+    let mut cursor = std::io::Cursor::new(buf.as_mut_slice());
+    let _ = write!(
+        cursor,
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+        tm.tm_year + 1900,
+        tm.tm_mon + 1,
+        tm.tm_mday,
+        tm.tm_hour,
+        tm.tm_min,
+        tm.tm_sec,
+    );
+}
+
 struct Udp2rawLogger;
 
 impl Log for Udp2rawLogger {
@@ -64,8 +86,9 @@ impl Log for Udp2rawLogger {
         let color = ENABLE_COLOR.load(Ordering::Relaxed);
         let position = ENABLE_POSITION.load(Ordering::Relaxed);
 
-        let now = chrono::Local::now();
-        let timestamp = now.format("%Y-%m-%d %H:%M:%S");
+        let mut ts_buf = [0u8; 19];
+        format_local_time(&mut ts_buf);
+        let timestamp = std::str::from_utf8(&ts_buf).unwrap_or("????-??-?? ??:??:??");
 
         let level_str = match record.level() {
             Level::Error => "FATAL", // We map Rust Error to our FATAL/ERROR

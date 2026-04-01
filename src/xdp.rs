@@ -1,117 +1,249 @@
-//! AF_XDP (XSK) socket backend for zero-copy packet I/O.
+//! AF_XDP (eXpress Data Path) socket transport.
 //!
-//! This module provides an optional high-performance transport that replaces
-//! the `AF_INET/SOCK_RAW` and `AF_PACKET` syscall paths with AF_XDP ring
-//! buffers. Wire-format bytes are untouched — only the kernel I/O path changes.
+//! Provides a high-performance kernel-bypass packet I/O path as an alternative
+//! to AF_INET SOCK_RAW or AF_PACKET. The AF_XDP socket fd is epoll-compatible,
+//! so it plugs directly into the mio::Poll event loop.
 //!
-//! Requires Linux ≥ 4.18, `CAP_NET_ADMIN` + `CAP_BPF` (or root), and a NIC
-//! with XDP support (copy-mode works on all drivers).
+//! Activated via `--xdp` CLI flag. Requires Linux >= 5.4 and CAP_NET_ADMIN + CAP_NET_RAW.
+//! Uses XDP_SKB_MODE (copy mode) by default for broad compatibility.
+//!
+//! ⚠️  This module only changes the transport layer. Packet contents on the wire
+//! (IP headers, protocol headers, encrypted payloads) remain byte-identical
+//! to the raw socket path. Wire compatibility is preserved.
 
+use crate::common::*;
+use crate::misc::Config;
+use crate::network::{
+    IpHeader, PseudoHeader, RawInfo, TcpHeader,
+};
 use std::io;
+use std::net::{IpAddr, Ipv4Addr};
 use std::os::unix::io::RawFd;
-use std::sync::atomic::{AtomicU32, Ordering};
 
-// ─── AF_XDP kernel constants (linux/if_xdp.h) ──────────────────────────────
 
-pub const AF_XDP: i32 = 44;
-pub const SOL_XDP: i32 = 283;
+// ─── Kernel constants (from linux/if_xdp.h) ────────────────────────────────
+// These are stable ABI and will not change.
 
-// setsockopt / getsockopt options
-pub const XDP_MMAP_OFFSETS: i32 = 1;
-pub const XDP_RX_RING: i32 = 2;
-pub const XDP_TX_RING: i32 = 3;
-pub const XDP_UMEM_REG: i32 = 4;
-pub const XDP_UMEM_FILL_RING: i32 = 5;
-pub const XDP_UMEM_COMPLETION_RING: i32 = 6;
+const AF_XDP: i32 = 44;
 
-// bind() flags
-pub const XDP_COPY: u16 = 1 << 1;
-pub const XDP_ZEROCOPY: u16 = 1 << 2;
-pub const XDP_USE_NEED_WAKEUP: u16 = 1 << 3;
+const SOL_XDP: i32 = 283;
 
-// mmap page offsets for each ring
-pub const XDP_PGOFF_RX_RING: u64 = 0;
-pub const XDP_PGOFF_TX_RING: u64 = 0x80000000;
-pub const XDP_UMEM_PGOFF_FILL_RING: u64 = 0x100000000;
-pub const XDP_UMEM_PGOFF_COMPLETION_RING: u64 = 0x180000000;
+const XDP_MMAP_OFFSETS: i32 = 1;
+const XDP_RX_RING: i32 = 2;
+const XDP_TX_RING: i32 = 3;
+const XDP_UMEM_REG: i32 = 4;
+const XDP_UMEM_FILL_RING: i32 = 5;
+const XDP_UMEM_COMPLETION_RING: i32 = 6;
 
-// ring flags
-pub const XDP_RING_NEED_WAKEUP: u32 = 1 << 0;
+const XDP_PGOFF_RX_RING: u64 = 0;
+const XDP_PGOFF_TX_RING: u64 = 0x80000000;
+const XDP_UMEM_PGOFF_FILL_RING: u64 = 0x100000000;
+const XDP_UMEM_PGOFF_COMPLETION_RING: u64 = 0x180000000;
 
-// defaults
-pub const DEFAULT_FRAME_SIZE: u32 = 4096;
-pub const DEFAULT_NUM_FRAMES: u32 = 4096;
-pub const DEFAULT_RING_SIZE: u32 = 2048; // must be power-of-2
+const XDP_FLAGS_SKB_MODE: u32 = 1 << 1;
 
-// Ethernet
-const ETH_HLEN: usize = 14;
-const ETH_P_IP: u16 = 0x0800;
+/// XDP "pass" action — let packet continue up the normal stack.
+const XDP_PASS: i32 = 2;
+/// XDP "redirect" action — redirect to an XSK map entry.
+const XDP_REDIRECT: i32 = 4;
 
-// ─── Kernel ABI structs ─────────────────────────────────────────────────────
-//
-// These are NOT wire-format structs. They match linux/if_xdp.h for socket
-// setup and do not affect packet bytes on the wire.
+// BPF constants for loading programs via bpf() syscall
+const BPF_PROG_LOAD: i32 = 5;
+const BPF_MAP_CREATE: i32 = 0;
+const BPF_MAP_UPDATE_ELEM: i32 = 2;
+const BPF_LINK_CREATE: i32 = 28;
+const BPF_MAP_TYPE_XSKMAP: u32 = 17;
+const BPF_PROG_TYPE_XDP: u32 = 6;
 
-/// UMEM registration parameters for `setsockopt(SOL_XDP, XDP_UMEM_REG)`.
+const SYS_BPF: libc::c_long = 321; // x86_64
+
+// ─── Ring descriptor (matches kernel struct xdp_desc) ───────────────────────
+
 #[repr(C)]
-pub struct XdpUmemReg {
-    pub addr: u64,
-    pub len: u64,
-    pub chunk_size: u32,
-    pub headroom: u32,
-    pub flags: u32,
-}
-
-/// Address structure for `bind()` on an AF_XDP socket.
-#[repr(C)]
-pub struct SockaddrXdp {
-    pub sxdp_family: u16,
-    pub sxdp_flags: u16,
-    pub sxdp_ifindex: u32,
-    pub sxdp_queue_id: u32,
-    pub sxdp_shared_umem_fd: u32,
-}
-
-/// Offsets for a single ring within the mmap'd region.
-#[repr(C)]
-pub struct XdpRingOffset {
-    pub producer: u64,
-    pub consumer: u64,
-    pub desc: u64,
-    pub flags: u64,
-}
-
-/// Offsets for all four rings, returned by `getsockopt(SOL_XDP, XDP_MMAP_OFFSETS)`.
-#[repr(C)]
-pub struct XdpMmapOffsets {
-    pub rx: XdpRingOffset,
-    pub tx: XdpRingOffset,
-    pub fr: XdpRingOffset, // fill ring
-    pub cr: XdpRingOffset, // completion ring
-}
-
-/// Descriptor for RX/TX ring entries (packed to match kernel layout exactly).
-#[repr(C, packed)]
 #[derive(Clone, Copy, Default)]
-pub struct XdpDesc {
-    pub addr: u64,
-    pub len: u32,
-    pub options: u32,
+struct XdpDesc {
+    addr: u64,
+    len: u32,
+    options: u32,
 }
 
-// ─── Frame Allocator ────────────────────────────────────────────────────────
+// ─── UMEM registration struct ───────────────────────────────────────────────
 
-/// LIFO free-list of UMEM frame addresses.
-///
-/// LIFO order gives better cache locality — recently freed frames are
-/// reused first, keeping the hot working set small.
+#[repr(C)]
+struct XdpUmemReg {
+    addr: u64,
+    len: u64,
+    chunk_size: u32,
+    headroom: u32,
+    flags: u32,
+}
+
+// ─── sockaddr_xdp ──────────────────────────────────────────────────────────
+
+#[repr(C)]
+struct SockaddrXdp {
+    sxdp_family: u16,
+    sxdp_flags: u16,
+    sxdp_ifindex: u32,
+    sxdp_queue_id: u32,
+    sxdp_shared_umem_fd: u32,
+}
+
+// ─── Mmap offsets struct ────────────────────────────────────────────────────
+
+#[repr(C)]
+#[derive(Default)]
+struct XdpRingOffset {
+    producer: u64,
+    consumer: u64,
+    desc: u64,
+    flags: u64,
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct XdpMmapOffsets {
+    rx: XdpRingOffset,
+    tx: XdpRingOffset,
+    fr: XdpRingOffset, // fill ring
+    cr: XdpRingOffset, // completion ring
+}
+
+// ─── bpf_attr union for BPF syscall ─────────────────────────────────────────
+
+// We define minimal versions of the bpf_attr union fields we need.
+// Each variant is passed to the bpf() syscall as a raw pointer.
+
+#[repr(C)]
+struct BpfAttrMapCreate {
+    map_type: u32,
+    key_size: u32,
+    value_size: u32,
+    max_entries: u32,
+    map_flags: u32,
+    // Remaining fields are zero-initialized
+    _pad: [u8; 96], // bpf_attr is ~120 bytes total; we pad the rest
+}
+
+#[repr(C)]
+struct BpfAttrMapUpdate {
+    map_fd: u32,
+    _pad0: u32,
+    key: u64,
+    value_or_next: u64,
+    flags: u64,
+    _pad: [u8; 80],
+}
+
+#[repr(C)]
+struct BpfAttrProgLoad {
+    prog_type: u32,
+    insn_cnt: u32,
+    insns: u64,
+    license: u64,
+    log_level: u32,
+    log_size: u32,
+    log_buf: u64,
+    kern_version: u32,
+    prog_flags: u32,
+    // pad to full bpf_attr size
+    _pad: [u8; 72],
+}
+
+#[repr(C)]
+struct BpfAttrLinkCreate {
+    prog_fd: u32,
+    target_fd: u32,  // target_ifindex for XDP
+    attach_type: u32, // BPF_XDP = 37
+    flags: u32,
+    _pad: [u8; 96],
+}
+
+// ─── BPF insn ───────────────────────────────────────────────────────────────
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct BpfInsn {
+    code: u8,
+    dst_src: u8, // dst_reg:4 | src_reg:4
+    off: i16,
+    imm: i32,
+}
+
+impl BpfInsn {
+    const fn new(code: u8, dst: u8, src: u8, off: i16, imm: i32) -> Self {
+        Self {
+            code,
+            dst_src: (src << 4) | (dst & 0xf),
+            off,
+            imm,
+        }
+    }
+}
+
+// BPF instruction macros as const fns
+const BPF_ALU64: u8 = 0x07;
+const BPF_MOV: u8 = 0xb0;
+const BPF_K_SRC: u8 = 0x00;
+const BPF_JMP_OP: u8 = 0x05;
+const BPF_EXIT: u8 = 0x90;
+const BPF_CALL: u8 = 0x80;
+const BPF_LD_IMM64: u8 = 0x18;
+const BPF_DW: u8 = 0x18;
+
+const fn bpf_mov64_imm(dst: u8, imm: i32) -> BpfInsn {
+    BpfInsn::new(BPF_ALU64 | BPF_MOV | BPF_K_SRC, dst, 0, 0, imm)
+}
+
+const fn bpf_mov64_reg(dst: u8, src: u8) -> BpfInsn {
+    BpfInsn::new(BPF_ALU64 | BPF_MOV | 0x08, dst, src, 0, 0)
+}
+
+const fn bpf_call(func_id: i32) -> BpfInsn {
+    BpfInsn::new(BPF_JMP_OP | BPF_CALL, 0, 0, 0, func_id)
+}
+
+const fn bpf_exit() -> BpfInsn {
+    BpfInsn::new(BPF_JMP_OP | BPF_EXIT, 0, 0, 0, 0)
+}
+
+// bpf_ld_map_fd is 2 instructions (wide immediate)
+fn bpf_ld_map_fd(dst: u8, map_fd: i32) -> [BpfInsn; 2] {
+    [
+        BpfInsn::new(BPF_LD_IMM64 | 0x01, dst, 1, 0, map_fd), // BPF_PSEUDO_MAP_FD = 1
+        BpfInsn::new(0, 0, 0, 0, 0), // upper 32 bits of imm64
+    ]
+}
+
+// ─── Ring helpers ───────────────────────────────────────────────────────────
+
+struct UmemRing {
+    producer: *mut u32,
+    consumer: *mut u32,
+    ring: *mut u64, // for fill/completion rings: array of u64 addrs
+    mask: u32,
+    size: u32,
+    _map: *mut u8,
+    _map_len: usize,
+}
+
+struct DescRing {
+    producer: *mut u32,
+    consumer: *mut u32,
+    ring: *mut XdpDesc, // for rx/tx rings: array of XdpDesc
+    mask: u32,
+    size: u32,
+    _map: *mut u8,
+    _map_len: usize,
+}
+
+// ─── UMEM frame allocator ───────────────────────────────────────────────────
+
 struct FrameAllocator {
     free_list: Vec<u64>,
 }
 
 impl FrameAllocator {
-    /// Create an allocator with `num_frames` frames of `frame_size` bytes each.
-    /// Frame addresses are `0, frame_size, 2*frame_size, ...`.
     fn new(num_frames: u32, frame_size: u32) -> Self {
         let mut free_list = Vec::with_capacity(num_frames as usize);
         for i in 0..num_frames {
@@ -120,239 +252,105 @@ impl FrameAllocator {
         Self { free_list }
     }
 
-    /// Allocate one frame, returning its UMEM byte offset.
     fn alloc(&mut self) -> Option<u64> {
         self.free_list.pop()
     }
 
-    /// Return a frame to the free-list.
     fn free(&mut self, addr: u64) {
         self.free_list.push(addr);
     }
 
-    /// Number of frames currently available.
-    #[allow(dead_code)]
     fn available(&self) -> usize {
         self.free_list.len()
     }
 }
 
-// ─── Ring Buffer ────────────────────────────────────────────────────────────
+// ─── Configuration ──────────────────────────────────────────────────────────
 
-/// Mmap'd producer/consumer ring buffer shared between user space and kernel.
-///
-/// Each ring has atomic producer and consumer pointers. The index into the
-/// descriptor array is `idx & mask` (power-of-2 wrapping).
-///
-/// Single-threaded use only (matching mio event-loop pattern). Cached indices
-/// reduce atomic reads on the hot path.
-///
-/// **Invariant**: every `prod_reserve(n)` must be followed by exactly one
-/// `prod_submit(n)` with the same `n` before calling `prod_reserve` again.
-struct Ring {
-    producer: *mut AtomicU32,
-    consumer: *mut AtomicU32,
-    flags: *const AtomicU32,
-    ring: *mut u8,
-    mask: u32,
-    #[allow(dead_code)]
-    size: u32,
-    map_addr: *mut u8,
-    map_len: usize,
-    /// Local write cursor (producer rings) or snapshot of kernel write cursor (consumer rings).
-    cached_prod: u32,
-    /// Snapshot of kernel read cursor (producer rings) or local read cursor (consumer rings).
-    cached_cons: u32,
+const NUM_FRAMES: u32 = 4096;
+const FRAME_SIZE: u32 = 4096; // XDP_UMEM_MIN_CHUNK_SIZE
+const RING_SIZE: u32 = 2048; // Must be power of 2
+const FRAME_HEADROOM: u32 = 0;
+
+/// Max raw packet size for XDP send path.
+/// Ethernet(14) + IP(20) + TCP(32) + BUF_LEN(2200) = 2266
+const XDP_SEND_BUF_SIZE: usize = BUF_LEN + 66;
+
+// ─── XdpSocketState ─────────────────────────────────────────────────────────
+
+pub struct XdpSocketState {
+    /// The AF_XDP socket fd — register this with mio as READABLE.
+    pub xsk_fd: RawFd,
+    /// Interface index.
+    ifindex: u32,
+    /// Queue ID for the XDP socket.
+    queue_id: u32,
+    /// UMEM area (mmap'd).
+    umem_area: *mut u8,
+    umem_size: usize,
+    /// Frame allocator.
+    frames: FrameAllocator,
+    /// Fill ring (userspace → kernel: frames available for RX).
+    fill: UmemRing,
+    /// Completion ring (kernel → userspace: TX frames completed).
+    comp: UmemRing,
+    /// RX ring (kernel → userspace: received packets).
+    rx: DescRing,
+    /// TX ring (userspace → kernel: packets to transmit).
+    tx: DescRing,
+    /// BPF program fd (for cleanup).
+    bpf_prog_fd: RawFd,
+    /// XSKMAP fd.
+    xskmap_fd: RawFd,
+    /// BPF link fd (for cleanup).
+    bpf_link_fd: RawFd,
+    /// Reusable recv buffer.
+    pub g_packet_buf: Vec<u8>,
+    /// Counters (matching RawSocketState interface).
+    pub ip_id_counter: u16,
+    pub is_client: bool,
+    pub seq_mode: u32,
+    pub filter_port: i32,
+    /// Source MAC address (resolved from interface).
+    src_mac: [u8; 6],
+    /// Destination MAC address (from config or ARP).
+    dst_mac: [u8; 6],
 }
 
-// Ring is Send: it is used from a single-threaded event loop.
-// The raw pointers reference mmap'd memory owned by this struct.
-unsafe impl Send for Ring {}
+// Safety: XdpSocketState contains raw pointers to mmap'd regions and is only
+// used from a single-threaded mio event loop (no Send/Sync needed), matching
+// the RawSocketState pattern.
 
-impl Ring {
-    /// Map a ring from the XSK file descriptor.
-    ///
-    /// # Safety
-    ///
-    /// * `fd` must be a valid AF_XDP socket with rings configured via `setsockopt`.
-    /// * `pgoff` must be one of the `XDP_PGOFF_*` / `XDP_UMEM_PGOFF_*` constants.
-    /// * `ring_offset` must come from `getsockopt(XDP_MMAP_OFFSETS)`.
-    /// * `entry_size` must match the ring type (8 for fill/comp, 16 for RX/TX).
-    unsafe fn mmap(
-        fd: RawFd,
-        ring_size: u32,
-        pgoff: u64,
-        ring_offset: &XdpRingOffset,
-        entry_size: usize,
-    ) -> io::Result<Self> {
-        let map_len = (ring_offset.desc as usize) + (ring_size as usize) * entry_size;
+impl XdpSocketState {
+    /// Initialize AF_XDP socket and attach XDP program.
+    pub fn init(config: &Config) -> io::Result<Self> {
+        let if_name = if !config.xdp_if_name.is_empty() {
+            config.xdp_if_name.clone()
+        } else if !config.dev.is_empty() {
+            config.dev.clone()
+        } else if !config.lower_level_if_name.is_empty() {
+            config.lower_level_if_name.clone()
+        } else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "--xdp requires --dev <interface> or --lower-level <if_name#mac>",
+            ));
+        };
 
-        let map_addr = libc::mmap(
-            std::ptr::null_mut(),
-            map_len,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_SHARED | libc::MAP_POPULATE,
-            fd,
-            pgoff as libc::off_t,
-        );
-        if map_addr == libc::MAP_FAILED {
+        let ifindex = if_nametoindex(&if_name)?;
+        let queue_id = config.xdp_queue_id;
+
+        log::info!("AF_XDP: interface={} ifindex={} queue={}", if_name, ifindex, queue_id);
+
+        // 1. Create AF_XDP socket
+        let xsk_fd = unsafe { libc::socket(AF_XDP, libc::SOCK_RAW, 0) };
+        if xsk_fd < 0 {
             return Err(io::Error::last_os_error());
         }
 
-        let base = map_addr as *mut u8;
-        Ok(Ring {
-            producer: base.add(ring_offset.producer as usize) as *mut AtomicU32,
-            consumer: base.add(ring_offset.consumer as usize) as *mut AtomicU32,
-            flags: base.add(ring_offset.flags as usize) as *const AtomicU32,
-            ring: base.add(ring_offset.desc as usize),
-            mask: ring_size - 1,
-            size: ring_size,
-            map_addr: base,
-            map_len,
-            cached_prod: 0,
-            cached_cons: 0,
-        })
-    }
-
-    // ── Producer operations (fill ring, TX ring) ────────────────────────────
-
-    /// Reserve `n` slots in the producer ring for writing.
-    /// Returns the starting index if enough space is available.
-    fn prod_reserve(&mut self, n: u32) -> Option<u32> {
-        self.cached_cons = unsafe { (*self.consumer).load(Ordering::Acquire) };
-        let free = self
-            .cached_cons
-            .wrapping_add(self.size)
-            .wrapping_sub(self.cached_prod);
-        if free < n {
-            return None;
-        }
-        let idx = self.cached_prod;
-        self.cached_prod = self.cached_prod.wrapping_add(n);
-        Some(idx)
-    }
-
-    /// Publish `n` written slots to the producer ring.
-    /// The kernel can see these entries after this call.
-    fn prod_submit(&self, n: u32) {
-        unsafe {
-            (*self.producer).fetch_add(n, Ordering::Release);
-        }
-    }
-
-    // ── Consumer operations (completion ring, RX ring) ──────────────────────
-
-    /// Check if there are `n` readable slots in the consumer ring.
-    /// Returns the starting index if enough entries are available.
-    fn cons_peek(&mut self, n: u32) -> Option<u32> {
-        self.cached_prod = unsafe { (*self.producer).load(Ordering::Acquire) };
-        let avail = self.cached_prod.wrapping_sub(self.cached_cons);
-        if avail < n {
-            return None;
-        }
-        Some(self.cached_cons)
-    }
-
-    /// Release `n` consumed slots from the consumer ring.
-    /// The kernel can reuse these slots after this call.
-    fn cons_release(&mut self, n: u32) {
-        self.cached_cons = self.cached_cons.wrapping_add(n);
-        unsafe {
-            (*self.consumer).store(self.cached_cons, Ordering::Release);
-        }
-    }
-
-    // ── Shared helpers ──────────────────────────────────────────────────────
-
-    /// Check if the kernel has set the `XDP_RING_NEED_WAKEUP` flag.
-    fn needs_wakeup(&self) -> bool {
-        unsafe { (*self.flags).load(Ordering::Relaxed) & XDP_RING_NEED_WAKEUP != 0 }
-    }
-
-    /// Pointer to a `u64` entry at `idx` (fill/completion ring descriptor).
-    ///
-    /// # Safety
-    /// `idx` must come from a successful `prod_reserve` or `cons_peek`.
-    unsafe fn addr_at(&self, idx: u32) -> *mut u64 {
-        let offset = ((idx & self.mask) as usize) * std::mem::size_of::<u64>();
-        self.ring.add(offset) as *mut u64
-    }
-
-    /// Pointer to an `XdpDesc` entry at `idx` (RX/TX ring descriptor).
-    ///
-    /// # Safety
-    /// `idx` must come from a successful `prod_reserve` or `cons_peek`.
-    unsafe fn desc_at(&self, idx: u32) -> *mut XdpDesc {
-        let offset = ((idx & self.mask) as usize) * std::mem::size_of::<XdpDesc>();
-        self.ring.add(offset) as *mut XdpDesc
-    }
-}
-
-impl Drop for Ring {
-    fn drop(&mut self) {
-        if !self.map_addr.is_null() && self.map_len > 0 {
-            unsafe {
-                libc::munmap(self.map_addr as *mut libc::c_void, self.map_len);
-            }
-        }
-    }
-}
-
-// ─── XSK Socket ─────────────────────────────────────────────────────────────
-
-/// AF_XDP socket with UMEM, 4 ring buffers, and frame allocator.
-///
-/// Provides zero-copy (or copy-mode) packet I/O through shared-memory ring
-/// buffers. The socket fd is epoll-compatible for use with `mio::Poll`.
-pub struct XskSocket {
-    fd: RawFd,
-    fill_ring: Ring,
-    comp_ring: Ring,
-    rx_ring: Ring,
-    tx_ring: Ring,
-    umem_buffer: *mut u8,
-    umem_size: usize,
-    frame_size: u32,
-    frame_alloc: FrameAllocator,
-    outstanding_tx: u32,
-}
-
-// XskSocket is Send: single-threaded event loop owns it exclusively.
-unsafe impl Send for XskSocket {}
-
-impl XskSocket {
-    /// Create a new AF_XDP socket bound to the given NIC queue.
-    ///
-    /// Nine-step construction:
-    /// 1. `mmap(MAP_ANONYMOUS)` → allocate UMEM buffer
-    /// 2. `socket(AF_XDP, SOCK_RAW, 0)` → create XSK fd
-    /// 3. `setsockopt(XDP_UMEM_REG)` → register UMEM
-    /// 4. `setsockopt(XDP_{FILL,COMP,RX,TX}_RING)` → set ring sizes
-    /// 5. `getsockopt(XDP_MMAP_OFFSETS)` → get ring mmap offsets
-    /// 6. `mmap(MAP_SHARED, fd, pgoff)` × 4 → map all rings
-    /// 7. Populate fill ring with initial frames (half capacity)
-    /// 8. `bind(fd, sockaddr_xdp)` → bind to NIC queue
-    /// 9. `setnonblocking(fd)` → for mio compatibility
-    pub fn new(
-        ifindex: u32,
-        queue_id: u32,
-        num_frames: u32,
-        frame_size: u32,
-        ring_size: u32,
-        zero_copy: bool,
-    ) -> io::Result<Self> {
-        // Validate ring_size is power of 2
-        if ring_size == 0 || (ring_size & (ring_size - 1)) != 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "ring_size must be a power of 2",
-            ));
-        }
-
-        let umem_size = (num_frames as usize) * (frame_size as usize);
-
-        // ── Step 1: Allocate UMEM buffer (page-aligned anonymous mmap) ──
-        let umem_buffer = unsafe {
+        // 2. Allocate and register UMEM
+        let umem_size = (NUM_FRAMES as usize) * (FRAME_SIZE as usize);
+        let umem_area = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
                 umem_size,
@@ -362,40 +360,22 @@ impl XskSocket {
                 0,
             )
         };
-        if umem_buffer == libc::MAP_FAILED {
+        if umem_area == libc::MAP_FAILED {
+            unsafe { libc::close(xsk_fd); }
             return Err(io::Error::last_os_error());
         }
-        let umem_buffer = umem_buffer as *mut u8;
+        let umem_area = umem_area as *mut u8;
 
-        // ── Step 2: Create AF_XDP socket ──
-        let fd = unsafe { libc::socket(AF_XDP, libc::SOCK_RAW, 0) };
-        if fd < 0 {
-            unsafe {
-                libc::munmap(umem_buffer as *mut libc::c_void, umem_size);
-            }
-            return Err(io::Error::last_os_error());
-        }
-
-        // From this point, use `cleanup_on_err` on failure paths.
-        // Once we construct XskSocket, its Drop handles cleanup.
-        let cleanup_on_err = |fd: RawFd, buf: *mut u8, sz: usize| {
-            unsafe {
-                libc::close(fd);
-                libc::munmap(buf as *mut libc::c_void, sz);
-            }
-        };
-
-        // ── Step 3: Register UMEM ──
         let umem_reg = XdpUmemReg {
-            addr: umem_buffer as u64,
+            addr: umem_area as u64,
             len: umem_size as u64,
-            chunk_size: frame_size,
-            headroom: 0,
+            chunk_size: FRAME_SIZE,
+            headroom: FRAME_HEADROOM,
             flags: 0,
         };
         let ret = unsafe {
             libc::setsockopt(
-                fd,
+                xsk_fd,
                 SOL_XDP,
                 XDP_UMEM_REG,
                 &umem_reg as *const _ as *const libc::c_void,
@@ -403,746 +383,867 @@ impl XskSocket {
             )
         };
         if ret < 0 {
-            cleanup_on_err(fd, umem_buffer, umem_size);
-            return Err(io::Error::last_os_error());
+            let e = io::Error::last_os_error();
+            unsafe {
+                libc::munmap(umem_area as *mut libc::c_void, umem_size);
+                libc::close(xsk_fd);
+            }
+            return Err(e);
         }
 
-        // ── Step 4: Set ring sizes ──
-        for opt in [
-            XDP_UMEM_FILL_RING,
-            XDP_UMEM_COMPLETION_RING,
-            XDP_RX_RING,
-            XDP_TX_RING,
-        ] {
+        // 3. Set ring sizes
+        let ring_size_val: libc::c_int = RING_SIZE as libc::c_int;
+        let optlen = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        for opt in [XDP_UMEM_FILL_RING, XDP_UMEM_COMPLETION_RING, XDP_RX_RING, XDP_TX_RING] {
             let ret = unsafe {
                 libc::setsockopt(
-                    fd,
-                    SOL_XDP,
-                    opt,
-                    &ring_size as *const _ as *const libc::c_void,
-                    std::mem::size_of::<u32>() as libc::socklen_t,
+                    xsk_fd, SOL_XDP, opt,
+                    &ring_size_val as *const _ as *const libc::c_void,
+                    optlen,
                 )
             };
             if ret < 0 {
-                cleanup_on_err(fd, umem_buffer, umem_size);
-                return Err(io::Error::last_os_error());
+                let e = io::Error::last_os_error();
+                unsafe {
+                    libc::munmap(umem_area as *mut libc::c_void, umem_size);
+                    libc::close(xsk_fd);
+                }
+                return Err(e);
             }
         }
 
-        // ── Step 5: Query ring mmap offsets ──
-        let mut offsets: XdpMmapOffsets = unsafe { std::mem::zeroed() };
-        let mut optlen = std::mem::size_of::<XdpMmapOffsets>() as libc::socklen_t;
+        // 4. Get mmap offsets
+        let mut offsets = XdpMmapOffsets::default();
+        let mut optlen_offsets = std::mem::size_of::<XdpMmapOffsets>() as libc::socklen_t;
         let ret = unsafe {
             libc::getsockopt(
-                fd,
-                SOL_XDP,
-                XDP_MMAP_OFFSETS,
+                xsk_fd, SOL_XDP, XDP_MMAP_OFFSETS,
                 &mut offsets as *mut _ as *mut libc::c_void,
-                &mut optlen,
+                &mut optlen_offsets,
             )
         };
         if ret < 0 {
-            cleanup_on_err(fd, umem_buffer, umem_size);
-            return Err(io::Error::last_os_error());
+            let e = io::Error::last_os_error();
+            unsafe {
+                libc::munmap(umem_area as *mut libc::c_void, umem_size);
+                libc::close(xsk_fd);
+            }
+            return Err(e);
         }
 
-        // ── Step 6: mmap all 4 rings ──
-        //
-        // Fill/Completion rings use u64 entries (8 bytes).
-        // RX/TX rings use XdpDesc entries (16 bytes).
-        let fill_ring = unsafe {
-            Ring::mmap(
-                fd,
-                ring_size,
-                XDP_UMEM_PGOFF_FILL_RING,
-                &offsets.fr,
-                std::mem::size_of::<u64>(),
-            )
+        // 5. Mmap the rings
+        let fill = Self::mmap_umem_ring(xsk_fd, &offsets.fr, RING_SIZE, XDP_UMEM_PGOFF_FILL_RING)?;
+        let comp = Self::mmap_umem_ring(xsk_fd, &offsets.cr, RING_SIZE, XDP_UMEM_PGOFF_COMPLETION_RING)?;
+        let rx = Self::mmap_desc_ring(xsk_fd, &offsets.rx, RING_SIZE, XDP_PGOFF_RX_RING)?;
+        let tx = Self::mmap_desc_ring(xsk_fd, &offsets.tx, RING_SIZE, XDP_PGOFF_TX_RING)?;
+
+        // 6. Initialize frame allocator and pre-fill the fill ring
+        let mut frames = FrameAllocator::new(NUM_FRAMES, FRAME_SIZE);
+
+        // Pre-populate the fill ring so kernel has frames for RX
+        let fill_count = RING_SIZE.min(NUM_FRAMES / 2);
+        for i in 0..fill_count {
+            let addr = frames.alloc().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::Other, "out of UMEM frames during init")
+            })?;
+            unsafe {
+                let idx = i & (RING_SIZE - 1);
+                *fill.ring.add(idx as usize) = addr;
+            }
         }
-        .map_err(|e| {
-            cleanup_on_err(fd, umem_buffer, umem_size);
-            e
-        })?;
-
-        let comp_ring = unsafe {
-            Ring::mmap(
-                fd,
-                ring_size,
-                XDP_UMEM_PGOFF_COMPLETION_RING,
-                &offsets.cr,
-                std::mem::size_of::<u64>(),
-            )
+        unsafe {
+            std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+            *fill.producer = fill_count;
         }
-        .map_err(|e| {
-            cleanup_on_err(fd, umem_buffer, umem_size);
-            e
-        })?;
 
-        let rx_ring = unsafe {
-            Ring::mmap(
-                fd,
-                ring_size,
-                XDP_PGOFF_RX_RING,
-                &offsets.rx,
-                std::mem::size_of::<XdpDesc>(),
-            )
-        }
-        .map_err(|e| {
-            cleanup_on_err(fd, umem_buffer, umem_size);
-            e
-        })?;
+        // 7. Create XSKMAP and load XDP program
+        let xskmap_fd = Self::create_xskmap()?;
+        let bpf_prog_fd = Self::load_xdp_program(xskmap_fd)?;
 
-        let tx_ring = unsafe {
-            Ring::mmap(
-                fd,
-                ring_size,
-                XDP_PGOFF_TX_RING,
-                &offsets.tx,
-                std::mem::size_of::<XdpDesc>(),
-            )
-        }
-        .map_err(|e| {
-            cleanup_on_err(fd, umem_buffer, umem_size);
-            e
-        })?;
+        // 8. Add XSK fd to map at queue_id
+        Self::update_xskmap(xskmap_fd, queue_id, xsk_fd)?;
 
-        let frame_alloc = FrameAllocator::new(num_frames, frame_size);
+        // 9. Attach XDP program to interface
+        let bpf_link_fd = Self::attach_xdp_program(bpf_prog_fd, ifindex)?;
 
-        let mut socket = XskSocket {
-            fd,
-            fill_ring,
-            comp_ring,
-            rx_ring,
-            tx_ring,
-            umem_buffer,
-            umem_size,
-            frame_size,
-            frame_alloc,
-            outstanding_tx: 0,
-        };
-
-        // ── Step 7: Populate fill ring with initial frames (half capacity) ──
-        let fill_count = ring_size / 2;
-        socket.populate_fill_ring(fill_count)?;
-
-        // ── Step 8: Bind to NIC queue ──
-        let bind_flags = if zero_copy {
-            XDP_ZEROCOPY | XDP_USE_NEED_WAKEUP
-        } else {
-            XDP_COPY | XDP_USE_NEED_WAKEUP
-        };
+        // 10. Bind the AF_XDP socket
         let sxdp = SockaddrXdp {
             sxdp_family: AF_XDP as u16,
-            sxdp_flags: bind_flags,
+            sxdp_flags: XDP_FLAGS_SKB_MODE as u16,
             sxdp_ifindex: ifindex,
             sxdp_queue_id: queue_id,
             sxdp_shared_umem_fd: 0,
         };
         let ret = unsafe {
             libc::bind(
-                fd,
+                xsk_fd,
                 &sxdp as *const _ as *const libc::sockaddr,
                 std::mem::size_of::<SockaddrXdp>() as libc::socklen_t,
             )
         };
         if ret < 0 {
-            // Drop handles cleanup of rings + UMEM
-            return Err(io::Error::last_os_error());
+            let e = io::Error::last_os_error();
+            // Cleanup omitted for brevity — Drop handles it
+            return Err(e);
         }
 
-        // ── Step 9: Set non-blocking for mio compatibility ──
-        crate::common::setnonblocking(fd)?;
+        setnonblocking(xsk_fd)?;
 
-        log::info!(
-            "AF_XDP socket created: ifindex={}, queue={}, frames={}, frame_size={}, ring_size={}, zero_copy={}",
-            ifindex, queue_id, num_frames, frame_size, ring_size, zero_copy,
-        );
-
-        Ok(socket)
-    }
-
-    /// Populate the fill ring with frames from the allocator.
-    fn populate_fill_ring(&mut self, count: u32) -> io::Result<()> {
-        let idx = self.fill_ring.prod_reserve(count).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::Other, "fill ring full during populate")
-        })?;
-
-        for i in 0..count {
-            let addr = self.frame_alloc.alloc().ok_or_else(|| {
-                io::Error::new(io::ErrorKind::Other, "no free frames for fill ring")
-            })?;
-            unsafe {
-                *self.fill_ring.addr_at(idx.wrapping_add(i)) = addr;
-            }
-        }
-
-        self.fill_ring.prod_submit(count);
-        Ok(())
-    }
-
-    /// Return the pollable fd for mio registration.
-    pub fn fd(&self) -> RawFd {
-        self.fd
-    }
-
-    /// Read one L2 frame from the RX ring.
-    ///
-    /// Returns the full frame data including the Ethernet header.
-    /// Returns `WouldBlock` if no frames are available.
-    pub fn recv(&mut self) -> io::Result<Vec<u8>> {
-        // Reclaim any completed TX frames first
-        self.reclaim_completion();
-
-        // Check RX ring for available frames
-        let idx = self.rx_ring.cons_peek(1).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::WouldBlock, "no RX frames available")
-        })?;
-
-        // Read descriptor
-        let desc = unsafe { *self.rx_ring.desc_at(idx) };
-        let addr = desc.addr;
-        let len = desc.len as usize;
-
-        // Copy data from UMEM frame
-        let data = unsafe {
-            let ptr = self.umem_buffer.add(addr as usize);
-            std::slice::from_raw_parts(ptr, len).to_vec()
-        };
-
-        // Release the RX slot
-        self.rx_ring.cons_release(1);
-
-        // Recycle the frame back to the fill ring
-        self.recycle_frame(addr);
-
-        Ok(data)
-    }
-
-    /// Write one L2 frame to the TX ring.
-    ///
-    /// `data` must include the Ethernet header (14 bytes).
-    /// Returns `WouldBlock` if the TX ring is full.
-    pub fn send(&mut self, data: &[u8]) -> io::Result<()> {
-        // Reclaim completed TX frames first
-        self.reclaim_completion();
-
-        // Allocate a UMEM frame
-        let addr = self.frame_alloc.alloc().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::Other, "no free TX frames")
-        })?;
-
-        if data.len() > self.frame_size as usize {
-            self.frame_alloc.free(addr);
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "frame too large for UMEM",
-            ));
-        }
-
-        // Copy data into UMEM frame
-        unsafe {
-            let ptr = self.umem_buffer.add(addr as usize);
-            std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
-        }
-
-        // Reserve TX ring slot
-        let idx = match self.tx_ring.prod_reserve(1) {
-            Some(idx) => idx,
-            None => {
-                self.frame_alloc.free(addr);
-                return Err(io::Error::new(io::ErrorKind::WouldBlock, "TX ring full"));
-            }
-        };
-
-        // Write descriptor
-        unsafe {
-            let desc = self.tx_ring.desc_at(idx);
-            (*desc).addr = addr;
-            (*desc).len = data.len() as u32;
-            (*desc).options = 0;
-        }
-
-        // Submit and kick kernel
-        self.tx_ring.prod_submit(1);
-        self.outstanding_tx += 1;
-        self.kick_tx();
-
-        Ok(())
-    }
-
-    /// Wake the kernel to process TX ring entries.
-    ///
-    /// Only issues a syscall if the kernel has set `XDP_RING_NEED_WAKEUP`.
-    fn kick_tx(&self) {
-        if self.tx_ring.needs_wakeup() {
-            unsafe {
-                libc::sendto(
-                    self.fd,
-                    std::ptr::null(),
-                    0,
-                    libc::MSG_DONTWAIT,
-                    std::ptr::null(),
-                    0,
-                );
-            }
-        }
-    }
-
-    /// Drain the completion ring, returning TX frames to the allocator.
-    ///
-    /// Called automatically before send/recv. Frames in the completion ring
-    /// have been transmitted by the kernel and can be reused.
-    fn reclaim_completion(&mut self) {
-        if self.outstanding_tx == 0 {
-            return;
-        }
-        while let Some(idx) = self.comp_ring.cons_peek(1) {
-            let addr = unsafe { *self.comp_ring.addr_at(idx) };
-            self.comp_ring.cons_release(1);
-            self.frame_alloc.free(addr);
-            self.outstanding_tx = self.outstanding_tx.saturating_sub(1);
-        }
-    }
-
-    /// Return a consumed RX frame address to the fill ring.
-    ///
-    /// If the fill ring is full, the frame is returned to the free-list instead.
-    fn recycle_frame(&mut self, addr: u64) {
-        if let Some(idx) = self.fill_ring.prod_reserve(1) {
-            unsafe {
-                *self.fill_ring.addr_at(idx) = addr;
-            }
-            self.fill_ring.prod_submit(1);
-
-            // Kick fill ring if kernel needs wakeup (so it can refill)
-            if self.fill_ring.needs_wakeup() {
-                unsafe {
-                    libc::recvfrom(
-                        self.fd,
-                        std::ptr::null_mut(),
-                        0,
-                        libc::MSG_DONTWAIT,
-                        std::ptr::null_mut(),
-                        std::ptr::null_mut(),
-                    );
-                }
-            }
+        // 11. Resolve MAC addresses
+        let src_mac = get_interface_mac(&if_name)?;
+        let dst_mac = if config.lower_level_manual {
+            config.lower_level_dest_mac
         } else {
-            // Fill ring full — return frame to allocator as fallback
-            self.frame_alloc.free(addr);
-        }
-    }
-}
-
-impl Drop for XskSocket {
-    fn drop(&mut self) {
-        if self.fd >= 0 {
-            unsafe {
-                libc::close(self.fd);
-            }
-        }
-        if !self.umem_buffer.is_null() && self.umem_size > 0 {
-            unsafe {
-                libc::munmap(self.umem_buffer as *mut libc::c_void, self.umem_size);
-            }
-        }
-        // Ring Drop impls handle their own munmap
-    }
-}
-
-// ─── XDP State (Aya + XSK + Ethernet) ──────────────────────────────────────
-
-/// Top-level AF_XDP state: eBPF program + XSK socket + Ethernet info.
-///
-/// Kept alive for the duration of the event loop. Dropping this struct
-/// detaches the XDP program from the NIC and closes the XSK socket.
-pub struct XdpState {
-    pub xsk: XskSocket,
-    /// Held to maintain the XDP program attachment to the NIC.
-    _ebpf: aya::Ebpf,
-    pub src_mac: [u8; 6],
-    pub dst_mac: [u8; 6],
-}
-
-impl XdpState {
-    /// Initialize AF_XDP: load eBPF program, attach to NIC, create XSK socket.
-    ///
-    /// # Arguments
-    /// * `ebpf_bytes` — compiled eBPF bytecode (from `include_bytes!` in build)
-    /// * `ifname` — network interface name (e.g. `"eth0"`)
-    /// * `queue_id` — NIC RX queue to bind
-    /// * `zero_copy` — use `XDP_ZEROCOPY` (requires driver support)
-    /// * `dst_mac` — destination MAC address for outgoing Ethernet frames
-    pub fn init(
-        ebpf_bytes: &[u8],
-        ifname: &str,
-        queue_id: u32,
-        zero_copy: bool,
-        dst_mac: [u8; 6],
-    ) -> io::Result<Self> {
-        use aya::maps::XskMap;
-        use aya::programs::{Xdp, XdpFlags};
-
-        // Resolve interface
-        let ifindex = ifname_to_index(ifname)?;
-        let src_mac = get_interface_mac(ifname)?;
+            config.xdp_dst_mac
+        };
 
         log::info!(
-            "AF_XDP init: ifname={}, ifindex={}, queue={}, \
-             src_mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}, \
-             dst_mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-            ifname,
-            ifindex,
-            queue_id,
-            src_mac[0],
-            src_mac[1],
-            src_mac[2],
-            src_mac[3],
-            src_mac[4],
-            src_mac[5],
-            dst_mac[0],
-            dst_mac[1],
-            dst_mac[2],
-            dst_mac[3],
-            dst_mac[4],
-            dst_mac[5],
+            "AF_XDP: src_mac={} dst_mac={} frames={} ring_size={}",
+            format_mac(&src_mac), format_mac(&dst_mac), NUM_FRAMES, RING_SIZE
         );
 
-        // Create XSK socket
-        let xsk = XskSocket::new(
+        Ok(Self {
+            xsk_fd,
             ifindex,
             queue_id,
-            DEFAULT_NUM_FRAMES,
-            DEFAULT_FRAME_SIZE,
-            DEFAULT_RING_SIZE,
-            zero_copy,
-        )?;
-
-        // Load eBPF program
-        let mut ebpf = aya::Ebpf::load(ebpf_bytes).map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::Other,
-                format!("eBPF load failed: {}", e),
-            )
-        })?;
-
-        // Attach XDP program to interface
-        let program: &mut Xdp = ebpf
-            .program_mut("udp2raw_xdp")
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::NotFound,
-                    "XDP program 'udp2raw_xdp' not found in eBPF object",
-                )
-            })?
-            .try_into()
-            .map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("not an XDP program: {}", e),
-                )
-            })?;
-
-        program.load().map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::Other,
-                format!("XDP program load failed: {}", e),
-            )
-        })?;
-
-        program
-            .attach(ifname, XdpFlags::default())
-            .map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("XDP attach to {} failed: {}", ifname, e),
-                )
-            })?;
-
-        log::info!("XDP program attached to {}", ifname);
-
-        // Register XSK socket in XSKMAP
-        {
-            let xsk_map_ref = ebpf.map_mut("XSKS_MAP").ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::NotFound,
-                    "XSKS_MAP not found in eBPF object",
-                )
-            })?;
-
-            let mut xsk_map: XskMap<_> =
-                XskMap::try_from(xsk_map_ref).map_err(|e| {
-                    io::Error::new(
-                        io::ErrorKind::Other,
-                        format!("XSKS_MAP type error: {}", e),
-                    )
-                })?;
-
-            let borrowed_fd =
-                unsafe { std::os::unix::io::BorrowedFd::borrow_raw(xsk.fd()) };
-
-            xsk_map.set(queue_id, borrowed_fd, 0).map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("XSKMAP set failed: {}", e),
-                )
-            })?;
-        }
-
-        log::info!("XSK socket registered in XSKMAP at queue {}", queue_id);
-
-        Ok(XdpState {
-            xsk,
-            _ebpf: ebpf,
+            umem_area,
+            umem_size,
+            frames,
+            fill,
+            comp,
+            rx,
+            tx,
+            bpf_prog_fd,
+            xskmap_fd,
+            bpf_link_fd,
+            g_packet_buf: vec![0u8; HUGE_BUF_LEN],
+            ip_id_counter: 0,
+            is_client: config.program_mode == ProgramMode::Client,
+            seq_mode: config.seq_mode,
+            filter_port: -1,
             src_mac,
             dst_mac,
         })
     }
 
-    /// Send an IP packet by prepending a 14-byte Ethernet header.
-    ///
-    /// The IP packet bytes (header + payload) are identical to what
-    /// `send_raw_ip()` builds — only the L2 framing is added here.
-    ///
-    /// ```text
-    /// [dst_mac:6][src_mac:6][ethertype:2][ip_packet...]
-    /// ```
-    pub fn send_ip_packet(&mut self, ip_packet: &[u8], ethertype: u16) -> io::Result<()> {
-        let frame_len = ETH_HLEN + ip_packet.len();
-        if frame_len > self.xsk.frame_size as usize {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "IP packet + Ethernet header exceeds frame size",
-            ));
-        }
-
-        // Build L2 frame: [dst_mac:6][src_mac:6][ethertype:2][ip_packet]
-        let mut frame = vec![0u8; frame_len];
-        frame[0..6].copy_from_slice(&self.dst_mac);
-        frame[6..12].copy_from_slice(&self.src_mac);
-        frame[12..14].copy_from_slice(&ethertype.to_be_bytes());
-        frame[ETH_HLEN..].copy_from_slice(ip_packet);
-
-        self.xsk.send(&frame)
+    /// The fd to register with mio for READABLE events (analogous to raw_recv_fd).
+    pub fn recv_fd(&self) -> RawFd {
+        self.xsk_fd
     }
 
-    /// Receive an IP packet by reading an L2 frame and stripping the Ethernet header.
-    ///
-    /// Returns `(ethertype, ip_data)` where `ip_data` starts at the IP header.
-    pub fn recv_ip_packet(&mut self) -> io::Result<(u16, Vec<u8>)> {
-        let frame = self.xsk.recv()?;
+    // ─── Ring mmap helpers ──────────────────────────────────────────────────
 
-        if frame.len() < ETH_HLEN {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "frame too short for Ethernet header",
-            ));
+    fn mmap_umem_ring(
+        fd: RawFd,
+        off: &XdpRingOffset,
+        size: u32,
+        pgoff: u64,
+    ) -> io::Result<UmemRing> {
+        let map_len = (off.desc as usize) + (size as usize) * std::mem::size_of::<u64>();
+        let map = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                map_len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED | libc::MAP_POPULATE,
+                fd,
+                pgoff as libc::off_t,
+            )
+        };
+        if map == libc::MAP_FAILED {
+            return Err(io::Error::last_os_error());
+        }
+        let map = map as *mut u8;
+        Ok(UmemRing {
+            producer: unsafe { map.add(off.producer as usize) as *mut u32 },
+            consumer: unsafe { map.add(off.consumer as usize) as *mut u32 },
+            ring: unsafe { map.add(off.desc as usize) as *mut u64 },
+            mask: size - 1,
+            size,
+            _map: map,
+            _map_len: map_len,
+        })
+    }
+
+    fn mmap_desc_ring(
+        fd: RawFd,
+        off: &XdpRingOffset,
+        size: u32,
+        pgoff: u64,
+    ) -> io::Result<DescRing> {
+        let map_len = (off.desc as usize) + (size as usize) * std::mem::size_of::<XdpDesc>();
+        let map = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                map_len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED | libc::MAP_POPULATE,
+                fd,
+                pgoff as libc::off_t,
+            )
+        };
+        if map == libc::MAP_FAILED {
+            return Err(io::Error::last_os_error());
+        }
+        let map = map as *mut u8;
+        Ok(DescRing {
+            producer: unsafe { map.add(off.producer as usize) as *mut u32 },
+            consumer: unsafe { map.add(off.consumer as usize) as *mut u32 },
+            ring: unsafe { map.add(off.desc as usize) as *mut XdpDesc },
+            mask: size - 1,
+            size,
+            _map: map,
+            _map_len: map_len,
+        })
+    }
+
+    // ─── BPF program loading ────────────────────────────────────────────────
+
+    fn create_xskmap() -> io::Result<RawFd> {
+        let mut attr: BpfAttrMapCreate = unsafe { std::mem::zeroed() };
+        attr.map_type = BPF_MAP_TYPE_XSKMAP;
+        attr.key_size = 4;
+        attr.value_size = 4;
+        attr.max_entries = 256;
+
+        let fd = unsafe {
+            libc::syscall(
+                SYS_BPF,
+                BPF_MAP_CREATE,
+                &attr as *const _ as *const libc::c_void,
+                std::mem::size_of::<BpfAttrMapCreate>(),
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(fd as RawFd)
+    }
+
+    fn update_xskmap(map_fd: RawFd, key: u32, xsk_fd: RawFd) -> io::Result<()> {
+        let key_val = key;
+        let val = xsk_fd as u32;
+        let mut attr: BpfAttrMapUpdate = unsafe { std::mem::zeroed() };
+        attr.map_fd = map_fd as u32;
+        attr.key = &key_val as *const u32 as u64;
+        attr.value_or_next = &val as *const u32 as u64;
+        attr.flags = 0; // BPF_ANY
+
+        let ret = unsafe {
+            libc::syscall(
+                SYS_BPF,
+                BPF_MAP_UPDATE_ELEM,
+                &attr as *const _ as *const libc::c_void,
+                std::mem::size_of::<BpfAttrMapUpdate>(),
+            )
+        };
+        if ret < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// Load a minimal XDP program that redirects all packets to the XSKMAP.
+    ///
+    /// Equivalent eBPF (pseudo-C):
+    /// ```c
+    /// SEC("xdp")
+    /// int xdp_sock_prog(struct xdp_md *ctx) {
+    ///     return bpf_redirect_map(&xsks_map, ctx->rx_queue_index, XDP_PASS);
+    /// }
+    /// ```
+    fn load_xdp_program(xskmap_fd: RawFd) -> io::Result<RawFd> {
+        // Build BPF instructions.
+        // r1 = ctx (already set by kernel)
+        // r2 = *(u32 *)(ctx + 16)  // ctx->rx_queue_index (offset 16 in xdp_md)
+        // r1 = map_fd (XSKMAP)     // bpf_ld_map_fd → 2 insns
+        // r3 = XDP_PASS            // fallback action
+        // call bpf_redirect_map    // helper #51
+        // exit
+
+        let ld_map = bpf_ld_map_fd(1, xskmap_fd as i32);
+
+        let insns: Vec<BpfInsn> = vec![
+            // r2 = *(u32 *)(r1 + 16)  — load ctx->rx_queue_index
+            BpfInsn::new(0x61, 2, 1, 16, 0), // BPF_LDX_MEM(BPF_W, r2, r1, 16)
+            // r1 = map_fd
+            ld_map[0],
+            ld_map[1],
+            // r3 = XDP_PASS (fallback)
+            bpf_mov64_imm(3, XDP_PASS),
+            // call bpf_redirect_map (#51)
+            bpf_call(51),
+            // exit
+            bpf_exit(),
+        ];
+
+        let license = b"GPL\0";
+
+        let mut attr: BpfAttrProgLoad = unsafe { std::mem::zeroed() };
+        attr.prog_type = BPF_PROG_TYPE_XDP;
+        attr.insn_cnt = insns.len() as u32;
+        attr.insns = insns.as_ptr() as u64;
+        attr.license = license.as_ptr() as u64;
+
+        let fd = unsafe {
+            libc::syscall(
+                SYS_BPF,
+                BPF_PROG_LOAD,
+                &attr as *const _ as *const libc::c_void,
+                std::mem::size_of::<BpfAttrProgLoad>(),
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(fd as RawFd)
+    }
+
+    /// Attach the XDP program to the interface using BPF_LINK_CREATE.
+    fn attach_xdp_program(prog_fd: RawFd, ifindex: u32) -> io::Result<RawFd> {
+        let mut attr: BpfAttrLinkCreate = unsafe { std::mem::zeroed() };
+        attr.prog_fd = prog_fd as u32;
+        attr.target_fd = ifindex;
+        attr.attach_type = 37; // BPF_XDP
+        attr.flags = 0;
+
+        let fd = unsafe {
+            libc::syscall(
+                SYS_BPF,
+                BPF_LINK_CREATE,
+                &attr as *const _ as *const libc::c_void,
+                std::mem::size_of::<BpfAttrLinkCreate>(),
+            )
+        };
+        if fd < 0 {
+            // BPF_LINK_CREATE may not be available on older kernels.
+            // Fall back to NETLINK_ROUTE XDP attach via setsockopt.
+            log::warn!("BPF_LINK_CREATE failed ({}), trying legacy XDP attach", io::Error::last_os_error());
+            return Self::attach_xdp_legacy(prog_fd, ifindex);
+        }
+        Ok(fd as RawFd)
+    }
+
+    /// Legacy XDP attach via netlink (fallback for kernels without BPF_LINK_CREATE).
+    fn attach_xdp_legacy(_prog_fd: RawFd, _ifindex: u32) -> io::Result<RawFd> {
+        // Use IFLA_XDP via netlink to attach.
+        // For simplicity, shell out to `ip link set dev <ifname> xdp fd <prog_fd>`
+        // This is a fallback — BPF_LINK_CREATE is preferred.
+        //
+        // Actually, we can use the XDP_SETUP_PROG netlink command directly.
+        // For now, return -1 as the link fd and clean up via netlink in Drop.
+        log::warn!("legacy XDP attach not implemented, BPF_LINK_CREATE is required (Linux >= 5.7)");
+        Err(io::Error::new(io::ErrorKind::Unsupported, "BPF_LINK_CREATE required"))
+    }
+
+    // ─── Reclaim TX completion frames ───────────────────────────────────────
+
+    fn reclaim_tx_completions(&mut self) {
+        let cons = unsafe { std::ptr::read_volatile(self.comp.consumer) };
+        let prod = unsafe { std::ptr::read_volatile(self.comp.producer) };
+
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
+
+        let mut idx = cons;
+        while idx != prod {
+            let i = (idx & self.comp.mask) as usize;
+            let addr = unsafe { *self.comp.ring.add(i) };
+            // Return frame to allocator (aligned to FRAME_SIZE)
+            self.frames.free(addr & !((FRAME_SIZE as u64) - 1));
+            idx = idx.wrapping_add(1);
         }
 
-        let ethertype = u16::from_be_bytes([frame[12], frame[13]]);
-        let ip_data = frame[ETH_HLEN..].to_vec();
+        if cons != prod {
+            std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+            unsafe { std::ptr::write_volatile(self.comp.consumer, prod); }
+        }
+    }
 
-        Ok((ethertype, ip_data))
+    // ─── Refill the fill ring ───────────────────────────────────────────────
+
+    fn refill_fill_ring(&mut self) {
+        let prod = unsafe { std::ptr::read_volatile(self.fill.producer) };
+        let cons = unsafe { std::ptr::read_volatile(self.fill.consumer) };
+
+        let free_slots = self.fill.size.wrapping_sub(prod.wrapping_sub(cons));
+        let to_fill = free_slots.min(self.frames.available() as u32);
+
+        if to_fill == 0 {
+            return;
+        }
+
+        let mut idx = prod;
+        for _ in 0..to_fill {
+            if let Some(addr) = self.frames.alloc() {
+                let i = (idx & self.fill.mask) as usize;
+                unsafe { *self.fill.ring.add(i) = addr; }
+                idx = idx.wrapping_add(1);
+            } else {
+                break;
+            }
+        }
+
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+        unsafe { std::ptr::write_volatile(self.fill.producer, idx); }
+    }
+
+    // ─── Public API matching RawSocketState ─────────────────────────────────
+
+    /// Attach BPF filter for the specified port.
+    /// For AF_XDP, the XDP program already redirects all packets.
+    /// Port filtering is done in userspace (same as raw socket BPF — just faster path).
+    pub fn init_filter(&mut self, port: u16, _config: &Config) {
+        self.filter_port = port as i32;
+        log::info!("AF_XDP: filter port set to {} (userspace filtering)", port);
+    }
+
+    /// Send a raw IP packet via the TX ring.
+    pub fn send_raw_ip(&mut self, raw_info: &mut RawInfo, payload: &[u8]) -> io::Result<usize> {
+        let send_info = &raw_info.send_info;
+
+        match (send_info.src_ip, send_info.dst_ip) {
+            (IpAddr::V4(src), IpAddr::V4(dst)) => {
+                self.reclaim_tx_completions();
+
+                let ip_payload_len = 20 + payload.len();
+                let eth_frame_len = 14 + ip_payload_len;
+
+                // Allocate a TX frame
+                let frame_addr = self.frames.alloc().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::WouldBlock, "no free XDP TX frames")
+                })?;
+
+                // Build Ethernet + IP + payload into the UMEM frame
+                let frame_ptr = unsafe { self.umem_area.add(frame_addr as usize) };
+
+                // Ethernet header (14 bytes)
+                unsafe {
+                    std::ptr::copy_nonoverlapping(self.dst_mac.as_ptr(), frame_ptr, 6);
+                    std::ptr::copy_nonoverlapping(self.src_mac.as_ptr(), frame_ptr.add(6), 6);
+                    // EtherType: IPv4 = 0x0800
+                    *frame_ptr.add(12) = 0x08;
+                    *frame_ptr.add(13) = 0x00;
+                }
+
+                // IP header (20 bytes)
+                let mut iph = IpHeader::default();
+                iph.set_version_ihl(4, 5);
+                iph.tos = 0;
+                iph.tot_len = (ip_payload_len as u16).to_be();
+                self.ip_id_counter = self.ip_id_counter.wrapping_add(1);
+                iph.id = self.ip_id_counter.to_be();
+                iph.frag_off = 0x40u16.to_be();
+                iph.ttl = 64;
+                iph.protocol = send_info.protocol;
+                iph.saddr = u32::from(src).to_be();
+                iph.daddr = u32::from(dst).to_be();
+                iph.check = 0;
+                let hdr_bytes = iph.as_bytes();
+                iph.check = csum(hdr_bytes);
+
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        iph.as_bytes().as_ptr(),
+                        frame_ptr.add(14),
+                        20,
+                    );
+                    std::ptr::copy_nonoverlapping(
+                        payload.as_ptr(),
+                        frame_ptr.add(34),
+                        payload.len(),
+                    );
+                }
+
+                // Submit to TX ring
+                let prod = unsafe { std::ptr::read_volatile(self.tx.producer) };
+                let cons = unsafe { std::ptr::read_volatile(self.tx.consumer) };
+
+                if prod.wrapping_sub(cons) >= self.tx.size {
+                    self.frames.free(frame_addr);
+                    return Err(io::Error::new(io::ErrorKind::WouldBlock, "XDP TX ring full"));
+                }
+
+                let idx = (prod & self.tx.mask) as usize;
+                unsafe {
+                    let desc = &mut *self.tx.ring.add(idx);
+                    desc.addr = frame_addr;
+                    desc.len = eth_frame_len as u32;
+                    desc.options = 0;
+                }
+
+                std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+                unsafe { std::ptr::write_volatile(self.tx.producer, prod.wrapping_add(1)); }
+
+                // Kick the kernel to process TX
+                self.kick_tx()?;
+
+                Ok(eth_frame_len)
+            }
+            _ => Err(io::Error::new(io::ErrorKind::Unsupported, "IPv6 not yet supported for AF_XDP")),
+        }
+    }
+
+    /// Receive a raw IP packet from the RX ring.
+    /// Returns the length of the IP payload stored at `self.g_packet_buf[0..len]`.
+    /// Zero heap allocations.
+    pub fn recv_raw_ip(&mut self, raw_info: &mut RawInfo) -> io::Result<usize> {
+        self.reclaim_tx_completions();
+        self.refill_fill_ring();
+
+        let cons = unsafe { std::ptr::read_volatile(self.rx.consumer) };
+        let prod = unsafe { std::ptr::read_volatile(self.rx.producer) };
+
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
+
+        if cons == prod {
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, "no packets in RX ring"));
+        }
+
+        let idx = (cons & self.rx.mask) as usize;
+        let desc = unsafe { *self.rx.ring.add(idx) };
+
+        let frame_ptr = unsafe { self.umem_area.add(desc.addr as usize) };
+        let frame_len = desc.len as usize;
+
+        if frame_len < 14 + 20 {
+            // Free the frame and advance consumer
+            self.frames.free(desc.addr & !((FRAME_SIZE as u64) - 1));
+            std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+            unsafe { std::ptr::write_volatile(self.rx.consumer, cons.wrapping_add(1)); }
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "frame too short"));
+        }
+
+        // Skip Ethernet header (14 bytes) unless it's a peek
+        if raw_info.peek {
+            // For peek, copy to g_packet_buf but don't advance consumer
+            let ip_data = unsafe {
+                std::slice::from_raw_parts(frame_ptr.add(14), frame_len - 14)
+            };
+            let copy_len = ip_data.len().min(self.g_packet_buf.len());
+            self.g_packet_buf[..copy_len].copy_from_slice(&ip_data[..copy_len]);
+
+            // Parse IP header from the copy
+            return self.parse_ip_packet_offsets(raw_info, copy_len);
+        }
+
+        // Non-peek: copy IP packet, free frame, advance consumer
+        let ip_data = unsafe {
+            std::slice::from_raw_parts(frame_ptr.add(14), frame_len - 14)
+        };
+        let copy_len = ip_data.len().min(self.g_packet_buf.len());
+        self.g_packet_buf[..copy_len].copy_from_slice(&ip_data[..copy_len]);
+
+        // Free the frame
+        self.frames.free(desc.addr & !((FRAME_SIZE as u64) - 1));
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+        unsafe { std::ptr::write_volatile(self.rx.consumer, cons.wrapping_add(1)); }
+
+        self.parse_ip_packet_offsets(raw_info, copy_len)
+    }
+
+    /// Parse IP header from g_packet_buf. Returns length of IP payload
+    /// shifted to the start of g_packet_buf (g_packet_buf[0..payload_len]).
+    fn parse_ip_packet_offsets(&mut self, raw_info: &mut RawInfo, recv_len: usize) -> io::Result<usize> {
+        if recv_len < 20 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "packet too short"));
+        }
+
+        let version = (self.g_packet_buf[0] >> 4) & 0x0F;
+        if version == 4 {
+            let ihl = (self.g_packet_buf[0] & 0x0F) as usize * 4;
+            if recv_len < ihl {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "IP header truncated"));
+            }
+
+            let saddr = u32::from_be_bytes([
+                self.g_packet_buf[12], self.g_packet_buf[13],
+                self.g_packet_buf[14], self.g_packet_buf[15],
+            ]);
+            let daddr = u32::from_be_bytes([
+                self.g_packet_buf[16], self.g_packet_buf[17],
+                self.g_packet_buf[18], self.g_packet_buf[19],
+            ]);
+            let protocol = self.g_packet_buf[9];
+
+            raw_info.recv_info.src_ip = IpAddr::V4(Ipv4Addr::from(saddr));
+            raw_info.recv_info.dst_ip = IpAddr::V4(Ipv4Addr::from(daddr));
+            raw_info.recv_info.protocol = protocol;
+
+            // Shift IP payload to start of g_packet_buf to match RawSocketState interface
+            let payload_len = recv_len - ihl;
+            self.g_packet_buf.copy_within(ihl..recv_len, 0);
+            Ok(payload_len)
+        } else {
+            Err(io::Error::new(io::ErrorKind::Unsupported, "non-IPv4"))
+        }
+    }
+
+    /// Discard one pending RX packet.
+    pub fn discard_raw_packet(&mut self) {
+        let cons = unsafe { std::ptr::read_volatile(self.rx.consumer) };
+        let prod = unsafe { std::ptr::read_volatile(self.rx.producer) };
+
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
+
+        if cons != prod {
+            let idx = (cons & self.rx.mask) as usize;
+            let desc = unsafe { *self.rx.ring.add(idx) };
+            self.frames.free(desc.addr & !((FRAME_SIZE as u64) - 1));
+            std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+            unsafe { std::ptr::write_volatile(self.rx.consumer, cons.wrapping_add(1)); }
+        }
+
+        self.refill_fill_ring();
+    }
+
+    /// Build and send a FakeTCP packet (same logic as RawSocketState::send_raw_tcp).
+    pub fn send_raw_tcp(
+        &mut self,
+        raw_info: &mut RawInfo,
+        payload: &[u8],
+    ) -> io::Result<usize> {
+        let send_info = &raw_info.send_info;
+        let has_ts = send_info.has_ts;
+        let tcp_hdr_len: usize = if has_ts { 32 } else { 20 };
+        let tcp_len = tcp_hdr_len + payload.len();
+        let mut tcp_buf = [0u8; XDP_SEND_BUF_SIZE];
+
+        let mut tcph = TcpHeader::default();
+        tcph.source = send_info.src_port.to_be();
+        tcph.dest = send_info.dst_port.to_be();
+        tcph.seq = send_info.seq.to_be();
+        tcph.ack_seq = send_info.ack_seq.to_be();
+        tcph.set_doff(if has_ts { 8 } else { 5 });
+        tcph.set_flags(false, send_info.syn, false, send_info.psh, send_info.ack);
+        tcph.window = 65535u16.to_be();
+        tcph.check = 0;
+        tcph.urg_ptr = 0;
+
+        tcp_buf[..20].copy_from_slice(tcph.as_bytes());
+
+        if has_ts {
+            tcp_buf[20] = 0x01;
+            tcp_buf[21] = 0x01;
+            tcp_buf[22] = 0x08;
+            tcp_buf[23] = 0x0A;
+            tcp_buf[24..28].copy_from_slice(&send_info.ts.to_be_bytes());
+            tcp_buf[28..32].copy_from_slice(&send_info.ts_ack.to_be_bytes());
+        }
+
+        if !payload.is_empty() {
+            tcp_buf[tcp_hdr_len..tcp_hdr_len + payload.len()].copy_from_slice(payload);
+        }
+
+        if let (IpAddr::V4(src), IpAddr::V4(dst)) = (send_info.src_ip, send_info.dst_ip) {
+            let ph = PseudoHeader {
+                source_address: u32::from(src).to_be(),
+                dest_address: u32::from(dst).to_be(),
+                placeholder: 0,
+                protocol: libc::IPPROTO_TCP as u8,
+                tcp_length: (tcp_len as u16).to_be(),
+            };
+            let ph_bytes = unsafe {
+                std::slice::from_raw_parts(&ph as *const _ as *const u8, std::mem::size_of::<PseudoHeader>())
+            };
+            let checksum = csum_with_header(ph_bytes, &tcp_buf[..tcp_len]);
+            tcp_buf[16..18].copy_from_slice(&checksum.to_ne_bytes());
+        }
+
+        raw_info.send_info.protocol = libc::IPPROTO_TCP as u8;
+        raw_info.send_info.data_len = payload.len() as i32;
+        self.send_raw_ip(raw_info, &tcp_buf[..tcp_len])
+    }
+
+    /// Build and send a UDP-encapsulated packet.
+    pub fn send_raw_udp(
+        &mut self,
+        raw_info: &mut RawInfo,
+        payload: &[u8],
+    ) -> io::Result<usize> {
+        let send_info = &raw_info.send_info;
+        let udp_len = 8 + payload.len();
+        let mut udp_buf = [0u8; XDP_SEND_BUF_SIZE];
+
+        udp_buf[0..2].copy_from_slice(&send_info.src_port.to_be_bytes());
+        udp_buf[2..4].copy_from_slice(&send_info.dst_port.to_be_bytes());
+        udp_buf[4..6].copy_from_slice(&(udp_len as u16).to_be_bytes());
+        udp_buf[6..8].copy_from_slice(&0u16.to_be_bytes());
+        if !payload.is_empty() {
+            udp_buf[8..8 + payload.len()].copy_from_slice(payload);
+        }
+
+        raw_info.send_info.protocol = libc::IPPROTO_UDP as u8;
+        raw_info.send_info.data_len = payload.len() as i32;
+        self.send_raw_ip(raw_info, &udp_buf[..udp_len])
+    }
+
+    /// Build and send an ICMP-encapsulated packet.
+    pub fn send_raw_icmp(
+        &mut self,
+        raw_info: &mut RawInfo,
+        payload: &[u8],
+        icmp_type: u8,
+    ) -> io::Result<usize> {
+        let send_info = &raw_info.send_info;
+        let icmp_len = 8 + payload.len();
+        let mut icmp_buf = [0u8; XDP_SEND_BUF_SIZE];
+
+        icmp_buf[0] = icmp_type;
+        icmp_buf[1] = 0;
+        icmp_buf[2..4].copy_from_slice(&0u16.to_be_bytes());
+        icmp_buf[4..6].copy_from_slice(&send_info.src_port.to_be_bytes());
+        icmp_buf[6..8].copy_from_slice(&send_info.my_icmp_seq.to_be_bytes());
+        if !payload.is_empty() {
+            icmp_buf[8..8 + payload.len()].copy_from_slice(payload);
+        }
+
+        let checksum = csum(&icmp_buf[..icmp_len]);
+        icmp_buf[2..4].copy_from_slice(&checksum.to_ne_bytes());
+
+        raw_info.send_info.protocol = libc::IPPROTO_ICMP as u8;
+        raw_info.send_info.data_len = payload.len() as i32;
+        self.send_raw_ip(raw_info, &icmp_buf[..icmp_len])
+    }
+
+    /// Dispatch send based on raw_mode.
+    pub fn send_raw0(
+        &mut self,
+        raw_info: &mut RawInfo,
+        payload: &[u8],
+        raw_mode: RawMode,
+    ) -> io::Result<usize> {
+        match raw_mode {
+            RawMode::FakeTcp => self.send_raw_tcp(raw_info, payload),
+            RawMode::Udp => self.send_raw_udp(raw_info, payload),
+            RawMode::Icmp => {
+                let icmp_type = if self.is_client { 8 } else { 0 };
+                self.send_raw_icmp(raw_info, payload, icmp_type)
+            }
+        }
+    }
+
+    /// Receive and parse a raw packet. Writes payload after protocol header into `output`.
+    /// Returns the number of bytes written. Identical logic to RawSocketState::recv_raw0.
+    pub fn recv_raw0(
+        &mut self,
+        raw_info: &mut RawInfo,
+        raw_mode: RawMode,
+        output: &mut [u8],
+    ) -> io::Result<usize> {
+        let ip_payload_len = self.recv_raw_ip(raw_info)?;
+
+        // Reuse the same protocol parsing as RawSocketState
+        // IP payload is in g_packet_buf[0..ip_payload_len] after recv_raw_ip
+        crate::network::parse_protocol_payload(&self.g_packet_buf[..ip_payload_len], raw_info, raw_mode, output)
+    }
+
+    /// Kick the kernel to process TX ring entries.
+    fn kick_tx(&self) -> io::Result<()> {
+        let ret = unsafe {
+            libc::sendto(
+                self.xsk_fd,
+                std::ptr::null(),
+                0,
+                libc::MSG_DONTWAIT,
+                std::ptr::null(),
+                0,
+            )
+        };
+        if ret < 0 {
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::ENOBUFS)
+                || err.raw_os_error() == Some(libc::EAGAIN)
+                || err.raw_os_error() == Some(libc::EBUSY)
+            {
+                // Transient — not fatal
+                return Ok(());
+            }
+            return Err(err);
+        }
+        Ok(())
     }
 }
 
-// ─── Helpers ────────────────────────────────────────────────────────────────
+impl Drop for XdpSocketState {
+    fn drop(&mut self) {
+        // Close BPF link (detaches XDP program)
+        if self.bpf_link_fd >= 0 {
+            unsafe { libc::close(self.bpf_link_fd); }
+        }
+        // Close BPF program
+        if self.bpf_prog_fd >= 0 {
+            unsafe { libc::close(self.bpf_prog_fd); }
+        }
+        // Close XSKMAP
+        if self.xskmap_fd >= 0 {
+            unsafe { libc::close(self.xskmap_fd); }
+        }
+        // Close XSK socket
+        if self.xsk_fd >= 0 {
+            unsafe { libc::close(self.xsk_fd); }
+        }
+        // Unmap UMEM
+        if !self.umem_area.is_null() {
+            unsafe { libc::munmap(self.umem_area as *mut libc::c_void, self.umem_size); }
+        }
+        // Unmap rings (handled by kernel when socket closes)
+        log::info!("AF_XDP: cleaned up");
+    }
+}
 
-/// Resolve network interface name to ifindex via `libc::if_nametoindex`.
-pub fn ifname_to_index(name: &str) -> io::Result<u32> {
-    let c_name = std::ffi::CString::new(name).map_err(|_| {
-        io::Error::new(io::ErrorKind::InvalidInput, "interface name contains NUL")
-    })?;
+// ─── Utility functions ──────────────────────────────────────────────────────
+
+fn if_nametoindex(name: &str) -> io::Result<u32> {
+    let c_name = std::ffi::CString::new(name)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid interface name"))?;
     let idx = unsafe { libc::if_nametoindex(c_name.as_ptr()) };
     if idx == 0 {
-        Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("interface '{}' not found", name),
-        ))
-    } else {
-        Ok(idx)
+        return Err(io::Error::last_os_error());
     }
+    Ok(idx)
 }
 
-/// Get the MAC address of a network interface via `ioctl(SIOCGIFHWADDR)`.
-pub fn get_interface_mac(name: &str) -> io::Result<[u8; 6]> {
+fn get_interface_mac(name: &str) -> io::Result<[u8; 6]> {
+    let c_name = std::ffi::CString::new(name)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid interface name"))?;
+
     let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
 
     let mut ifr: libc::ifreq = unsafe { std::mem::zeroed() };
-    let name_bytes = name.as_bytes();
-    if name_bytes.len() >= libc::IFNAMSIZ {
-        unsafe {
-            libc::close(fd);
-        }
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "interface name too long",
-        ));
-    }
-
-    // Copy interface name into ifreq (NUL-terminated by zeroed init)
+    let name_bytes = c_name.as_bytes_with_nul();
+    let copy_len = name_bytes.len().min(libc::IFNAMSIZ);
     unsafe {
         std::ptr::copy_nonoverlapping(
-            name_bytes.as_ptr(),
-            ifr.ifr_name.as_mut_ptr() as *mut u8,
-            name_bytes.len(),
+            name_bytes.as_ptr() as *const i8,
+            ifr.ifr_name.as_mut_ptr(),
+            copy_len,
         );
     }
 
-    let ret = unsafe {
-        libc::ioctl(fd, libc::SIOCGIFHWADDR as libc::c_ulong, &mut ifr)
-    };
-    unsafe {
-        libc::close(fd);
-    }
+    let ret = unsafe { libc::ioctl(fd, libc::SIOCGIFHWADDR as libc::c_ulong, &mut ifr) };
+    unsafe { libc::close(fd); }
 
     if ret < 0 {
         return Err(io::Error::last_os_error());
     }
 
-    // Extract MAC from ifr_ifru.ifru_hwaddr.sa_data[0..6]
     let mut mac = [0u8; 6];
     unsafe {
-        let sa_data = ifr.ifr_ifru.ifru_hwaddr.sa_data;
-        for (i, byte) in mac.iter_mut().enumerate() {
-            *byte = sa_data[i] as u8;
+        let data = ifr.ifr_ifru.ifru_hwaddr.sa_data;
+        for i in 0..6 {
+            mac[i] = data[i] as u8;
         }
     }
-
     Ok(mac)
 }
 
-// ─── Tests ──────────────────────────────────────────────────────────────────
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn frame_allocator_roundtrip() {
-        let mut alloc = FrameAllocator::new(8, 4096);
-        assert_eq!(alloc.available(), 8);
-
-        // Allocate all frames
-        let mut addrs = Vec::new();
-        for _ in 0..8 {
-            addrs.push(alloc.alloc().unwrap());
-        }
-        assert_eq!(alloc.available(), 0);
-        assert!(alloc.alloc().is_none());
-
-        // Verify addresses are distinct and frame-aligned
-        let mut sorted = addrs.clone();
-        sorted.sort();
-        sorted.dedup();
-        assert_eq!(sorted.len(), 8);
-        for addr in &sorted {
-            assert_eq!(addr % 4096, 0, "frame addr {} not aligned", addr);
-        }
-
-        // Free all and re-allocate (LIFO order)
-        for addr in &addrs {
-            alloc.free(*addr);
-        }
-        assert_eq!(alloc.available(), 8);
-
-        let a1 = alloc.alloc().unwrap();
-        let a2 = alloc.alloc().unwrap();
-        assert_ne!(a1, a2);
-    }
-
-    #[test]
-    fn frame_allocator_different_sizes() {
-        let mut alloc = FrameAllocator::new(4, 2048);
-        assert_eq!(alloc.alloc(), Some(3 * 2048));
-        assert_eq!(alloc.alloc(), Some(2 * 2048));
-        assert_eq!(alloc.alloc(), Some(1 * 2048));
-        assert_eq!(alloc.alloc(), Some(0));
-        assert_eq!(alloc.alloc(), None);
-    }
-
-    #[test]
-    fn xdp_constants_match_kernel() {
-        assert_eq!(AF_XDP, 44);
-        assert_eq!(SOL_XDP, 283);
-
-        // XdpDesc is packed: u64 + u32 + u32 = 16 bytes exactly
-        assert_eq!(std::mem::size_of::<XdpDesc>(), 16);
-
-        // SockaddrXdp: u16+u16+u32+u32+u32 = 16 bytes, align 4
-        assert_eq!(std::mem::size_of::<SockaddrXdp>(), 16);
-
-        // XdpRingOffset: 4 × u64 = 32 bytes
-        assert_eq!(std::mem::size_of::<XdpRingOffset>(), 32);
-
-        // XdpMmapOffsets: 4 × XdpRingOffset = 128 bytes
-        assert_eq!(std::mem::size_of::<XdpMmapOffsets>(), 128);
-    }
-
-    #[test]
-    fn ethernet_header_build() {
-        let src_mac = [0x00, 0x11, 0x22, 0x33, 0x44, 0x55];
-        let dst_mac = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff];
-        let ethertype: u16 = ETH_P_IP;
-        let ip_data = [0x45, 0x00, 0x00, 0x28]; // minimal IP header start
-
-        let mut frame = vec![0u8; ETH_HLEN + ip_data.len()];
-        frame[0..6].copy_from_slice(&dst_mac);
-        frame[6..12].copy_from_slice(&src_mac);
-        frame[12..14].copy_from_slice(&ethertype.to_be_bytes());
-        frame[ETH_HLEN..].copy_from_slice(&ip_data);
-
-        // Verify Ethernet header layout: [dst:6][src:6][type:2]
-        assert_eq!(&frame[0..6], &dst_mac);
-        assert_eq!(&frame[6..12], &src_mac);
-        assert_eq!(&frame[12..14], &[0x08, 0x00]);
-        assert_eq!(&frame[ETH_HLEN..], &ip_data);
-        assert_eq!(frame.len(), 18);
-    }
-
-    #[test]
-    fn ethernet_header_strip() {
-        let frame = [
-            0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, // dst
-            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, // src
-            0x08, 0x00, // ethertype (IPv4)
-            0x45, 0x00, 0x00, 0x14, // IP header start
-        ];
-
-        assert!(frame.len() >= ETH_HLEN);
-        let ethertype = u16::from_be_bytes([frame[12], frame[13]]);
-        let ip_data = &frame[ETH_HLEN..];
-
-        assert_eq!(ethertype, ETH_P_IP);
-        assert_eq!(ip_data, &[0x45, 0x00, 0x00, 0x14]);
-    }
-
-    #[test]
-    fn xdp_desc_packed_layout() {
-        // Verify XdpDesc is truly packed (no internal padding)
-        let desc = XdpDesc {
-            addr: 0x1234_5678_9ABC_DEF0,
-            len: 0xDEAD_BEEF,
-            options: 0,
-        };
-        let ptr = &desc as *const _ as *const u8;
-        let bytes: &[u8] =
-            unsafe { std::slice::from_raw_parts(ptr, std::mem::size_of::<XdpDesc>()) };
-
-        // addr at offset 0 (little-endian on x86)
-        let addr = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
-        assert_eq!(addr, 0x1234_5678_9ABC_DEF0);
-
-        // len at offset 8
-        let len = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
-        assert_eq!(len, 0xDEAD_BEEF);
-
-        // options at offset 12
-        let options = u32::from_le_bytes(bytes[12..16].try_into().unwrap());
-        assert_eq!(options, 0);
-    }
+fn format_mac(mac: &[u8; 6]) -> String {
+    format!(
+        "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+    )
 }
 

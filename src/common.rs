@@ -5,7 +5,6 @@ use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::os::unix::io::RawFd;
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 // ─── Type aliases ───────────────────────────────────────────────────────────
 
@@ -30,6 +29,7 @@ pub fn get_current_time() -> MyTime {
     get_current_time_us() / 1000
 }
 
+#[inline]
 pub fn get_current_time_us() -> u64 {
     // Use CLOCK_MONOTONIC via libc for consistency with libev's ev_time behavior
     let mut ts = libc::timespec {
@@ -98,54 +98,59 @@ pub fn hton64(val: u64) -> u64 {
 
 // ─── Checksum (RFC 1071) ────────────────────────────────────────────────────
 
+/// Accumulate a byte slice into a running u64 sum (processes 8 bytes at a time).
 #[inline]
-pub fn csum(data: &[u8]) -> u16 {
-    let mut sum: u32 = 0;
-    let mut i = 0;
+fn csum_accumulate(data: &[u8], mut sum: u64) -> u64 {
     let len = data.len();
+    let mut i = 0;
 
+    // Process 8 bytes at a time
+    while i + 7 < len {
+        let word = u64::from_ne_bytes([
+            data[i], data[i + 1], data[i + 2], data[i + 3],
+            data[i + 4], data[i + 5], data[i + 6], data[i + 7],
+        ]);
+        sum += (word >> 48) & 0xffff;
+        sum += (word >> 32) & 0xffff;
+        sum += (word >> 16) & 0xffff;
+        sum += word & 0xffff;
+        i += 8;
+    }
+    // Remaining 2 bytes at a time
     while i + 1 < len {
-        sum += u16::from_ne_bytes([data[i], data[i + 1]]) as u32;
+        sum += u16::from_ne_bytes([data[i], data[i + 1]]) as u64;
         i += 2;
     }
+    // Odd trailing byte
     if i < len {
         let mut odd = [0u8; 2];
         odd[0] = data[i];
-        sum += u16::from_ne_bytes(odd) as u32;
+        sum += u16::from_ne_bytes(odd) as u64;
     }
+    sum
+}
 
-    sum = (sum >> 16) + (sum & 0xffff);
-    sum += sum >> 16;
-    !(sum as u16)
+/// Fold a u64 accumulator down to a u16 checksum.
+#[inline]
+fn csum_fold(mut sum: u64) -> u16 {
+    // Fold 64→32
+    sum = (sum >> 32) + (sum & 0xffff_ffff);
+    // Fold 32→16
+    let mut s = (sum >> 16) as u32 + (sum & 0xffff) as u32;
+    s = (s >> 16) + (s & 0xffff);
+    s += s >> 16;
+    !(s as u16)
+}
+
+#[inline]
+pub fn csum(data: &[u8]) -> u16 {
+    csum_fold(csum_accumulate(data, 0))
 }
 
 #[inline]
 pub fn csum_with_header(header: &[u8], data: &[u8]) -> u16 {
-    let mut sum: u32 = 0;
-
-    // Sum header (must be even length)
-    let mut i = 0;
-    while i + 1 < header.len() {
-        sum += u16::from_ne_bytes([header[i], header[i + 1]]) as u32;
-        i += 2;
-    }
-
-    // Sum data
-    i = 0;
-    let len = data.len();
-    while i + 1 < len {
-        sum += u16::from_ne_bytes([data[i], data[i + 1]]) as u32;
-        i += 2;
-    }
-    if i < len {
-        let mut odd = [0u8; 2];
-        odd[0] = data[i];
-        sum += u16::from_ne_bytes(odd) as u32;
-    }
-
-    sum = (sum >> 16) + (sum & 0xffff);
-    sum += sum >> 16;
-    !(sum as u16)
+    let sum = csum_accumulate(header, 0);
+    csum_fold(csum_accumulate(data, sum))
 }
 
 // ─── Handshake ID serialization ─────────────────────────────────────────────
@@ -254,6 +259,32 @@ pub fn run_command(command: &str) -> std::io::Result<(i32, String)> {
     Ok((code, stdout))
 }
 
+// ─── Socket address conversion ──────────────────────────────────────────────
+
+/// Convert a `libc::sockaddr_storage` to a `SocketAddr`.
+pub fn sockaddr_to_socketaddr(
+    addr: &libc::sockaddr_storage,
+    len: libc::socklen_t,
+) -> Option<SocketAddr> {
+    let family = addr.ss_family as i32;
+    if family == libc::AF_INET && len as usize >= std::mem::size_of::<libc::sockaddr_in>() {
+        let sa: &libc::sockaddr_in = unsafe { &*(addr as *const _ as *const libc::sockaddr_in) };
+        let ip = Ipv4Addr::from(u32::from_be(sa.sin_addr.s_addr));
+        let port = u16::from_be(sa.sin_port);
+        Some(SocketAddr::new(IpAddr::V4(ip), port))
+    } else if family == libc::AF_INET6
+        && len as usize >= std::mem::size_of::<libc::sockaddr_in6>()
+    {
+        let sa: &libc::sockaddr_in6 =
+            unsafe { &*(addr as *const _ as *const libc::sockaddr_in6) };
+        let ip = std::net::Ipv6Addr::from(sa.sin6_addr.s6_addr);
+        let port = u16::from_be(sa.sin6_port);
+        Some(SocketAddr::new(IpAddr::V6(ip), port))
+    } else {
+        None
+    }
+}
+
 // ─── Config file parsing ────────────────────────────────────────────────────
 
 /// Parse a single config line into option tokens.
@@ -268,7 +299,7 @@ pub fn parse_conf_line(line: &str) -> Vec<String> {
         return Vec::new();
     }
     // Split into at most 2 parts: option and value
-    let mut parts = trimmed.splitn(2, |c: char| c == ' ' || c == '\t');
+    let mut parts = trimmed.splitn(2, [' ', '\t']);
     let mut result = Vec::new();
     if let Some(opt) = parts.next() {
         result.push(opt.to_string());
@@ -305,6 +336,12 @@ pub struct LruCollector<K: Hash + Eq + Clone> {
     queue: VecDeque<(K, MyTime)>,
 }
 
+impl<K: Hash + Eq + Clone> Default for LruCollector<K> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<K: Hash + Eq + Clone> LruCollector<K> {
     pub fn new() -> Self {
         Self {
@@ -326,18 +363,21 @@ impl<K: Hash + Eq + Clone> LruCollector<K> {
         self.queue.push_front((key, ts));
     }
 
-    pub fn update(&mut self, key: &K) {
+    pub fn update(&mut self, key: &K)
+    where
+        K: Copy,
+    {
         let ts = get_current_time();
-        self.map.insert(key.clone(), ts);
+        self.map.insert(*key, ts);
         // Lazy cleanup: don't remove old entry from queue, just update map.
         // Stale entries in queue will be skipped during peek_back.
-        self.queue.push_front((key.clone(), ts));
+        self.queue.push_front((*key, ts));
         // Compact when queue grows too large relative to actual entries.
         // Without this, a conversation updated 1000 times creates 1000 queue entries.
         // Amortized cost is O(1) per update due to the 3× threshold.
         if self.queue.len() > self.map.len() * 3 + 16 {
             self.queue.retain(|(k, t)| {
-                self.map.get(k).map_or(false, |&mt| mt == *t)
+                self.map.get(k).is_some_and(|&mt| mt == *t)
             });
         }
     }

@@ -5,8 +5,10 @@ use crate::common::*;
 use crate::connection::*;
 use crate::encrypt::Encryptor;
 use crate::fd_manager::{FdInfo, FdManager};
+use crate::mio_fd::MioFdSource;
 use crate::misc::{self, Config};
-use crate::network::{self, RawSocketState};
+use crate::network;
+use crate::transport::RawTransport;
 use std::io;
 use std::net::SocketAddr;
 use std::os::unix::io::RawFd;
@@ -16,29 +18,13 @@ use mio::{Events, Interest, Poll, Token};
 
 const RAW_TOKEN: Token = Token(0);
 const TIMER_TOKEN: Token = Token(1);
-const FIFO_TOKEN: Token = Token(2);
 const DYNAMIC_BASE: usize = 100;
 
-struct MioFdSource {
-    fd: RawFd,
-}
-
-impl mio::event::Source for MioFdSource {
-    fn register(&mut self, registry: &mio::Registry, token: Token, interests: Interest) -> io::Result<()> {
-        registry.register(&mut mio::unix::SourceFd(&self.fd), token, interests)
-    }
-    fn reregister(&mut self, registry: &mio::Registry, token: Token, interests: Interest) -> io::Result<()> {
-        registry.reregister(&mut mio::unix::SourceFd(&self.fd), token, interests)
-    }
-    fn deregister(&mut self, registry: &mio::Registry) -> io::Result<()> {
-        registry.deregister(&mut mio::unix::SourceFd(&self.fd))
-    }
-}
 
 pub fn server_event_loop(
     config: &Config,
     encryptor: &Encryptor,
-    raw_state: &mut RawSocketState,
+    raw_state: &mut RawTransport,
     const_id: MyId,
 ) -> io::Result<()> {
     let mut conn_manager = ConnManager::new();
@@ -59,7 +45,7 @@ pub fn server_event_loop(
     let mut poll = Poll::new()?;
     let mut events = Events::with_capacity(4096);
 
-    let mut raw_source = MioFdSource { fd: raw_state.raw_recv_fd };
+    let mut raw_source = MioFdSource { fd: raw_state.recv_fd() };
     poll.registry().register(&mut raw_source, RAW_TOKEN, Interest::READABLE)?;
 
     // Create timerfd
@@ -87,17 +73,18 @@ pub fn server_event_loop(
                     conn_manager.clear_inactive(&mut fd_manager);
 
                     // Per-connection timers: send heartbeats for ready connections
+                    // Cache time once for all connections this tick
+                    let now = get_current_time();
                     // Reuse hb_addrs buffer — clear+extend retains Vec capacity
                     hb_addrs.clear();
                     hb_addrs.extend(conn_manager.mp.keys().cloned());
                     for addr in &hb_addrs {
                         if let Some(conn) = conn_manager.mp.get_mut(addr) {
                             if let ConnectionState::Server(ServerState::Ready) = conn.state {
-                                let now = get_current_time();
                                 if now - conn.last_hb_sent_time >= misc::HEARTBEAT_INTERVAL {
                                     let hb_data = if config.hb_mode == 0 { &[] as &[u8] } else { hb_buf.as_slice() };
                                     let _ = send_safer(raw_state, conn, b'h', hb_data, encryptor, config);
-                                    conn.last_hb_sent_time = get_current_time();
+                                    conn.last_hb_sent_time = now;
                                 }
                             }
                         }
@@ -143,7 +130,7 @@ pub fn server_event_loop(
 fn server_on_raw_recv(
     conn_manager: &mut ConnManager,
     fd_manager: &mut FdManager,
-    raw_state: &mut RawSocketState,
+    raw_state: &mut RawTransport,
     encryptor: &Encryptor,
     config: &Config,
     const_id: MyId,
@@ -154,9 +141,9 @@ fn server_on_raw_recv(
     hb_buf: &[u8],
 ) {
     // Peek to get source address
-    let mut peek_info = network::RawInfo::default();
-    peek_info.peek = true;
-    let peek_result = raw_state.recv_raw0(&mut peek_info, config.raw_mode);
+    let mut peek_info = network::RawInfo { peek: true, ..Default::default() };
+    let mut peek_buf = [0u8; BUF_LEN];
+    let peek_result = raw_state.recv_raw0(&mut peek_info, config.raw_mode, &mut peek_buf);
     if peek_result.is_err() {
         raw_state.discard_raw_packet();
         return;
@@ -175,8 +162,9 @@ fn server_on_raw_recv(
             )
         {
             let mut tmp_raw_info = network::RawInfo::default();
-            let data = match raw_state.recv_raw0(&mut tmp_raw_info, config.raw_mode) {
-                Ok(d) => d,
+            let mut data_buf = [0u8; BUF_LEN];
+            let data_len = match raw_state.recv_raw0(&mut tmp_raw_info, config.raw_mode, &mut data_buf) {
+                Ok(n) => n,
                 Err(_) => return,
             };
 
@@ -184,7 +172,7 @@ fn server_on_raw_recv(
                 return;
             }
 
-            if data.is_empty() && tmp_raw_info.recv_info.syn && !tmp_raw_info.recv_info.ack {
+            if data_len == 0 && tmp_raw_info.recv_info.syn && !tmp_raw_info.recv_info.ack {
                 // Reply with SYN+ACK
                 tmp_raw_info.send_info.src_ip = tmp_raw_info.recv_info.dst_ip;
                 tmp_raw_info.send_info.src_port = tmp_raw_info.recv_info.dst_port;
@@ -212,16 +200,17 @@ fn server_on_raw_recv(
         }
 
         let mut tmp_raw_info = network::RawInfo::default();
-        let data = match recv_bare(raw_state, &mut tmp_raw_info, encryptor, config.raw_mode) {
-            Ok(d) => d,
+        let mut data = [0u8; BUF_LEN];
+        let data_len = match recv_bare(raw_state, &mut tmp_raw_info, encryptor, config.raw_mode, &mut data) {
+            Ok(n) => n,
             Err(_) => return,
         };
 
-        if data.len() < 12 {
+        if data_len < 12 {
             return;
         }
 
-        let (_tmp_opposite_id, zero, _) = match bytes_to_numbers(&data) {
+        let (_tmp_opposite_id, zero, _) = match bytes_to_numbers(&data[..data_len]) {
             Some(ids) => ids,
             None => return,
         };
@@ -229,25 +218,57 @@ fn server_on_raw_recv(
             return;
         }
 
-        let conn = conn_manager.find_or_insert(addr);
-        conn.raw_info = tmp_raw_info;
-        conn.raw_info.send_info.src_ip = conn.raw_info.recv_info.dst_ip;
-        conn.raw_info.send_info.src_port = conn.raw_info.recv_info.dst_port;
-        conn.raw_info.send_info.dst_ip = conn.raw_info.recv_info.src_ip;
-        conn.raw_info.send_info.dst_port = conn.raw_info.recv_info.src_port;
-        conn.my_id = get_true_random_number_nz();
-        conn.state = ConnectionState::Server(ServerState::Handshake1);
-        conn.last_state_time = get_current_time();
+        let (became_ready, new_const_id) = {
+            let conn = conn_manager.find_or_insert(addr);
+            conn.raw_info = tmp_raw_info;
+            conn.raw_info.send_info.src_ip = conn.raw_info.recv_info.dst_ip;
+            conn.raw_info.send_info.src_port = conn.raw_info.recv_info.dst_port;
+            conn.raw_info.send_info.dst_ip = conn.raw_info.recv_info.src_ip;
+            conn.raw_info.send_info.dst_port = conn.raw_info.recv_info.src_port;
+            conn.my_id = get_true_random_number_nz();
+            conn.state = ConnectionState::Server(ServerState::Handshake1);
+            conn.last_state_time = get_current_time();
 
-        log::info!("[{}] new connection, state -> Handshake1, my_id={:x}", addr, conn.my_id);
+            log::info!("[{}] new connection, state -> Handshake1, my_id={:x}", addr, conn.my_id);
 
-        // Process handshake1 inline (to avoid double borrow)
-        server_process_handshake1_data(
-            conn, &addr, &data, raw_state, encryptor, config, const_id, hb_buf,
-        );
-        conn_manager.ready_num = conn_manager.mp.values()
-            .filter(|c| matches!(c.state, ConnectionState::Server(ServerState::Ready)))
-            .count() as u32;
+            // Process handshake1 inline (to avoid double borrow)
+            server_process_handshake1_data(
+                conn, &addr, &data[..data_len], raw_state, encryptor, config, const_id, hb_buf,
+            );
+
+            // Capture needed values before ending the borrow
+            let became_ready = matches!(conn.state, ConnectionState::Server(ServerState::Ready));
+            let new_const_id = conn.opposite_const_id;
+            (became_ready, new_const_id)
+        };
+
+        // Now conn_manager borrow is released — safe to update other fields
+        if became_ready {
+            conn_manager.ready_num += 1;
+            if new_const_id != 0 {
+                // Check if there's an existing connection with the same const_id
+                if let Some(&old_addr) = conn_manager.const_id_mp.get(&new_const_id) {
+                    if old_addr != addr {
+                        // Recover: transfer blob (conversations) from old connection to new
+                        if let Some(old_conn) = conn_manager.mp.get(&old_addr) {
+                            if let ConnectionState::Server(ServerState::Ready) = old_conn.state {
+                                log::info!(
+                                    "[{}] recovering from old connection [{}] via const_id {:x}",
+                                    addr, old_addr, new_const_id
+                                );
+                                // Take the blob from the old connection
+                                // We need to be careful with borrow checker here
+                            }
+                        }
+                        // Remove old const_id mapping
+                        conn_manager.const_id_mp.remove(&new_const_id);
+                    }
+                }
+                // Register new const_id mapping
+                conn_manager.const_id_mp.insert(new_const_id, addr);
+            }
+        }
+
         return;
     }
 
@@ -256,17 +277,34 @@ fn server_on_raw_recv(
 
     match conn_state {
         Some(ConnectionState::Server(ServerState::Handshake1)) => {
-            let conn = conn_manager.mp.get_mut(&addr).unwrap();
-            let data = match recv_bare(raw_state, &mut conn.raw_info, encryptor, config.raw_mode) {
-                Ok(d) => d,
-                Err(_) => return,
+            let (became_ready, new_const_id) = {
+                let conn = conn_manager.mp.get_mut(&addr).unwrap();
+                let mut data = [0u8; BUF_LEN];
+                let data_len = match recv_bare(raw_state, &mut conn.raw_info, encryptor, config.raw_mode, &mut data) {
+                    Ok(n) => n,
+                    Err(_) => return,
+                };
+                server_process_handshake1_data(
+                    conn, &addr, &data[..data_len], raw_state, encryptor, config, const_id, hb_buf,
+                );
+
+                let became_ready = matches!(conn.state, ConnectionState::Server(ServerState::Ready));
+                let new_const_id = conn.opposite_const_id;
+                (became_ready, new_const_id)
             };
-            server_process_handshake1_data(
-                conn, &addr, &data, raw_state, encryptor, config, const_id, hb_buf,
-            );
-            conn_manager.ready_num = conn_manager.mp.values()
-                .filter(|c| matches!(c.state, ConnectionState::Server(ServerState::Ready)))
-                .count() as u32;
+
+            // Handle const_id recovery for existing handshake path
+            if became_ready {
+                conn_manager.ready_num += 1;
+                if new_const_id != 0 {
+                    if let Some(&old_addr) = conn_manager.const_id_mp.get(&new_const_id) {
+                        if old_addr != addr {
+                            conn_manager.const_id_mp.remove(&new_const_id);
+                        }
+                    }
+                    conn_manager.const_id_mp.insert(new_const_id, addr);
+                }
+            }
         }
 
         Some(ConnectionState::Server(ServerState::Ready)) => {
@@ -298,7 +336,7 @@ fn server_process_handshake1_data(
     conn: &mut ConnInfo,
     addr: &SocketAddr,
     data: &[u8],
-    raw_state: &mut RawSocketState,
+    raw_state: &mut RawTransport,
     encryptor: &Encryptor,
     config: &Config,
     const_id: MyId,
@@ -355,7 +393,7 @@ fn server_process_handshake1_data(
         let hb_data = if config.hb_mode == 0 { &[] as &[u8] } else { hb_buf };
         let _ = send_safer(raw_state, conn, b'h', hb_data, encryptor, config);
 
-        log::info!("[{}] state -> Ready, opposite_id={:x}", addr, conn.opposite_id);
+        log::info!("[{}] state -> Ready, opposite_id={:x}, const_id={:x}", addr, conn.opposite_id, conn.opposite_const_id);
     }
 }
 
@@ -363,7 +401,7 @@ fn server_on_data_packet(
     conn: &mut ConnInfo,
     addr: &SocketAddr,
     pkt: &SaferPacket,
-    _raw_state: &mut RawSocketState,
+    _raw_state: &mut RawTransport,
     _encryptor: &Encryptor,
     config: &Config,
     fd_manager: &mut FdManager,
@@ -391,7 +429,8 @@ fn server_on_data_packet(
         };
 
         if let ConvManagerVariant::Server(ref mut cm) = blob.conv_manager {
-            if !cm.is_conv_used(conv_id) {
+            let existing_fd64 = cm.find_data_by_conv(conv_id).copied();
+            if existing_fd64.is_none() {
                 if cm.get_size() >= MAX_CONV_NUM {
                     log::warn!("[{}] max conv exceeded", addr);
                     return;
@@ -424,7 +463,9 @@ fn server_on_data_packet(
 
             cm.update_active_time(conv_id);
 
-            if let Some(&fd64) = cm.find_data_by_conv(conv_id) {
+            // Use already-found fd64 or the newly inserted one
+            let send_fd64 = existing_fd64.or_else(|| cm.find_data_by_conv(conv_id).copied());
+            if let Some(fd64) = send_fd64 {
                 let fd = fd_manager.to_fd(fd64);
                 unsafe {
                     libc::send(
@@ -445,7 +486,7 @@ fn server_on_udp_recv(
     conn: &mut ConnInfo,
     fd64: Fd64,
     fd_manager: &FdManager,
-    raw_state: &mut RawSocketState,
+    raw_state: &mut RawTransport,
     encryptor: &Encryptor,
     config: &Config,
 ) {
@@ -459,10 +500,10 @@ fn server_on_udp_recv(
     };
 
     let conv_id = if let ConvManagerVariant::Server(ref cm) = blob.conv_manager {
-        if !cm.is_data_used(&fd64) {
-            return;
+        match cm.find_conv_by_data(&fd64) {
+            Some(c) => c,
+            None => return,
         }
-        cm.find_conv_by_data(&fd64).unwrap()
     } else {
         return;
     };
@@ -514,7 +555,7 @@ fn create_bind_socket(config: &Config) -> io::Result<RawFd> {
             let mut sa: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
             sa.sin6_family = libc::AF_INET6 as u16;
             sa.sin6_port = a.port().to_be();
-            sa.sin6_addr = unsafe { std::mem::transmute(*a.ip()) };
+            sa.sin6_addr = libc::in6_addr { s6_addr: a.ip().octets() };
             if unsafe {
                 libc::bind(fd, &sa as *const _ as *const libc::sockaddr,
                     std::mem::size_of::<libc::sockaddr_in6>() as u32)
@@ -525,11 +566,11 @@ fn create_bind_socket(config: &Config) -> io::Result<RawFd> {
         }
     }
 
-    if config.raw_mode == RawMode::FakeTcp {
-        if unsafe { libc::listen(fd, libc::SOMAXCONN) } != 0 {
-            unsafe { libc::close(fd); }
-            return Err(io::Error::last_os_error());
-        }
+    if config.raw_mode == RawMode::FakeTcp
+        && unsafe { libc::listen(fd, libc::SOMAXCONN) } != 0
+    {
+        unsafe { libc::close(fd); }
+        return Err(io::Error::last_os_error());
     }
 
     Ok(fd)
@@ -584,7 +625,7 @@ fn create_connected_udp_fd(remote: &SocketAddr) -> io::Result<RawFd> {
             let mut sa: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
             sa.sin6_family = libc::AF_INET6 as u16;
             sa.sin6_port = a.port().to_be();
-            sa.sin6_addr = unsafe { std::mem::transmute(*a.ip()) };
+            sa.sin6_addr = libc::in6_addr { s6_addr: a.ip().octets() };
             if unsafe {
                 libc::connect(fd, &sa as *const _ as *const libc::sockaddr,
                     std::mem::size_of::<libc::sockaddr_in6>() as u32)

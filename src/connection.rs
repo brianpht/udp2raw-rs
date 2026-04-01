@@ -6,7 +6,8 @@ use crate::common::*;
 use crate::encrypt::Encryptor;
 use crate::fd_manager::FdManager;
 use crate::misc::Config;
-use crate::network::{self, RawInfo, RawSocketState};
+use crate::network::{self, RawInfo};
+use crate::transport::RawTransport;
 use std::collections::HashMap;
 use std::hash::Hash;
 use std::net::SocketAddr;
@@ -36,11 +37,17 @@ pub struct AntiReplay {
     pub seq: AntiReplaySeq,
 }
 
+impl Default for AntiReplay {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AntiReplay {
     pub fn new() -> Self {
         Self {
             max_packet_received: 0,
-            window: vec![0u8; (ANTI_REPLAY_WINDOW_SIZE + 7) / 8],
+            window: vec![0u8; ANTI_REPLAY_WINDOW_SIZE.div_ceil(8)],
             seq: get_true_random_number_64() / 10,
         }
     }
@@ -50,6 +57,7 @@ impl AntiReplay {
         // window entries will be overwritten as needed
     }
 
+    #[inline]
     pub fn get_new_seq_for_send(&mut self) -> AntiReplaySeq {
         let s = self.seq;
         self.seq += 1;
@@ -71,6 +79,7 @@ impl AntiReplay {
         self.window[idx >> 3] &= !(1 << (idx & 7));
     }
 
+    #[inline]
     pub fn is_valid(&mut self, seq: u64, disable_anti_replay: bool) -> bool {
         if disable_anti_replay {
             return true;
@@ -116,6 +125,12 @@ pub struct ConvManager<T: Hash + Eq + Clone> {
     lru: LruCollector<u32>,
     pub clear_fn: Option<Box<dyn Fn(T)>>,
     last_clear_time: MyTime,
+}
+
+impl<T: Hash + Eq + Clone> Default for ConvManager<T> {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl<T: Hash + Eq + Clone> ConvManager<T> {
@@ -184,13 +199,12 @@ impl<T: Hash + Eq + Clone> ConvManager<T> {
             return;
         }
         self.last_clear_time = now;
-        self.clear_inactive0();
+        self.clear_inactive0(now);
     }
 
-    fn clear_inactive0(&mut self) {
+    fn clear_inactive0(&mut self, current_time: MyTime) {
         let size = self.lru.size();
         let num_to_clean = (size / CONV_CLEAR_RATIO + CONV_CLEAR_MIN).min(size);
-        let current_time = get_current_time();
         let mut cnt = 0;
 
         while cnt < num_to_clean {
@@ -343,6 +357,12 @@ pub struct ConnManager {
     last_clear_time: MyTime,
 }
 
+impl Default for ConnManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ConnManager {
     pub fn new() -> Self {
         Self {
@@ -369,13 +389,12 @@ impl ConnManager {
             return;
         }
         self.last_clear_time = now;
-        self.clear_inactive0(fd_manager);
+        self.clear_inactive0(fd_manager, now);
     }
 
-    fn clear_inactive0(&mut self, fd_manager: &mut FdManager) {
+    fn clear_inactive0(&mut self, fd_manager: &mut FdManager, current_time: MyTime) {
         let size = self.mp.len();
         let num_to_clean = (size / CONN_CLEAR_RATIO + CONN_CLEAR_MIN).min(size);
-        let current_time = get_current_time();
 
         let mut to_remove = Vec::new();
         let mut cnt = 0;
@@ -433,7 +452,7 @@ impl ConnManager {
 
 /// Send a bare packet (encrypted, no anti-replay). Used during handshake.
 pub fn send_bare(
-    raw_state: &mut RawSocketState,
+    raw_state: &mut RawTransport,
     raw_info: &mut RawInfo,
     data: &[u8],
     encryptor: &Encryptor,
@@ -468,16 +487,19 @@ pub fn send_bare(
 }
 
 /// Receive a bare packet (encrypted, no anti-replay). Used during handshake.
+/// Writes decrypted payload into `output` and returns the number of bytes written.
 pub fn recv_bare(
-    raw_state: &mut RawSocketState,
+    raw_state: &mut RawTransport,
     raw_info: &mut RawInfo,
     encryptor: &Encryptor,
     raw_mode: RawMode,
-) -> Result<Vec<u8>, ()> {
-    let encrypted = raw_state.recv_raw0(raw_info, raw_mode).map_err(|_| ())?;
+    output: &mut [u8],
+) -> Result<usize, ()> {
+    let mut recv_buf = [0u8; BUF_LEN];
+    let encrypted_len = raw_state.recv_raw0(raw_info, raw_mode, &mut recv_buf).map_err(|_| ())?;
 
-    if encrypted.len() > MAX_DATA_LEN + 1 {
-        log::debug!("recv_bare: data too long {}", encrypted.len());
+    if encrypted_len > MAX_DATA_LEN + 1 {
+        log::debug!("recv_bare: data too long {}", encrypted_len);
         return Err(());
     }
 
@@ -488,7 +510,7 @@ pub fn recv_bare(
     }
 
     let mut decrypted = [0u8; BUF_LEN];
-    let dec_len = encryptor.my_decrypt(&encrypted, &mut decrypted).map_err(|_| {
+    let dec_len = encryptor.my_decrypt(&recv_buf[..encrypted_len], &mut decrypted).map_err(|_| {
         log::debug!("recv_bare: decrypt failed");
     })?;
 
@@ -502,12 +524,14 @@ pub fn recv_bare(
     if data_start > dec_len {
         return Err(());
     }
-    Ok(decrypted[data_start..dec_len].to_vec())
+    let data_len = dec_len - data_start;
+    output[..data_len].copy_from_slice(&decrypted[data_start..dec_len]);
+    Ok(data_len)
 }
 
 /// Send handshake (wrapper around send_bare with 3 IDs).
 pub fn send_handshake(
-    raw_state: &mut RawSocketState,
+    raw_state: &mut RawTransport,
     raw_info: &mut RawInfo,
     id1: MyId,
     id2: MyId,
@@ -521,7 +545,7 @@ pub fn send_handshake(
 
 /// Send a safer packet (encrypted + anti-replay). Used for data and heartbeats.
 pub fn send_safer(
-    raw_state: &mut RawSocketState,
+    raw_state: &mut RawTransport,
     conn_info: &mut ConnInfo,
     pkt_type: u8, // b'h' or b'd'
     data: &[u8],
@@ -564,13 +588,13 @@ pub fn send_safer(
         if config.cipher_mode == CipherMode::Xor {
             buf2[0] ^= encryptor.keys.gro_xor[0];
             buf2[1] ^= encryptor.keys.gro_xor[1];
-        } else if config.cipher_mode == CipherMode::Aes128Cbc || config.cipher_mode == CipherMode::Aes128Cfb {
-            if final_len >= 16 {
-                let mut block = [0u8; 16];
-                block.copy_from_slice(&buf2[..16]);
-                encryptor.aes_ecb_encrypt_block(&mut block);
-                buf2[..16].copy_from_slice(&block);
-            }
+        } else if (config.cipher_mode == CipherMode::Aes128Cbc || config.cipher_mode == CipherMode::Aes128Cfb)
+            && final_len >= 16
+        {
+            let mut block = [0u8; 16];
+            block.copy_from_slice(&buf2[..16]);
+            encryptor.aes_ecb_encrypt_block(&mut block);
+            buf2[..16].copy_from_slice(&block);
         }
         raw_state
             .send_raw0(&mut conn_info.raw_info, &buf2[..final_len], config.raw_mode)
@@ -585,7 +609,7 @@ pub fn send_safer(
 
 /// Send data via safer (wraps conv_id + payload).
 pub fn send_data_safer(
-    raw_state: &mut RawSocketState,
+    raw_state: &mut RawTransport,
     conn_info: &mut ConnInfo,
     data: &[u8],
     conv_num: u32,
@@ -606,16 +630,18 @@ pub struct SaferPacket {
 
 /// Receive safer packet(s). Handles GRO (multiple packets in one recv).
 pub fn recv_safer_multi(
-    raw_state: &mut RawSocketState,
+    raw_state: &mut RawTransport,
     conn_info: &mut ConnInfo,
     encryptor: &Encryptor,
     config: &Config,
 ) -> Result<Vec<SaferPacket>, ()> {
-    let encrypted = raw_state.recv_raw0(&mut conn_info.raw_info, config.raw_mode).map_err(|_| ())?;
+    let mut recv_buf = [0u8; HUGE_BUF_LEN];
+    let encrypted_len = raw_state.recv_raw0(&mut conn_info.raw_info, config.raw_mode, &mut recv_buf).map_err(|_| ())?;
+    let encrypted = &recv_buf[..encrypted_len];
     let mut results = Vec::new();
 
     if !config.fix_gro {
-        if let Some(pkt) = parse_safer_single(conn_info, &encrypted, encryptor, config)? {
+        if let Some(pkt) = parse_safer_single(conn_info, encrypted, encryptor, config)? {
             results.push(pkt);
         }
     } else {
@@ -643,7 +669,26 @@ pub fn recv_safer_multi(
                 break;
             }
 
-            if let Ok(Some(pkt)) = parse_safer_single(conn_info, &encrypted[offset..offset + single_len], encryptor, config) {
+            // For AES modes, the first 14 bytes of the encrypted payload were decrypted
+            // as part of the 16-byte ECB block. We need to reconstruct the full payload
+            // with those decrypted bytes prepended.
+            let decrypt_result = if (config.cipher_mode == CipherMode::Aes128Cbc
+                || config.cipher_mode == CipherMode::Aes128Cfb)
+                && single_len >= 14
+            {
+                // Reconstruct into a stack buffer instead of heap-allocating
+                let mut reconstructed = [0u8; BUF_LEN];
+                let from_header = 14.min(single_len);
+                reconstructed[..from_header].copy_from_slice(&header[2..2 + from_header]);
+                if single_len > 14 {
+                    reconstructed[14..single_len].copy_from_slice(&encrypted[offset + 14..offset + single_len]);
+                }
+                parse_safer_single(conn_info, &reconstructed[..single_len], encryptor, config)
+            } else {
+                parse_safer_single(conn_info, &encrypted[offset..offset + single_len], encryptor, config)
+            };
+
+            if let Ok(Some(pkt)) = decrypt_result {
                 results.push(pkt);
             }
             offset += single_len;
@@ -707,9 +752,7 @@ fn parse_safer_single(
         conn_info.opposite_roller = roller;
         conn_info.last_opposite_roller_time = get_current_time();
     }
-    if config.hb_mode == 0 {
-        conn_info.my_roller = conn_info.my_roller.wrapping_add(1);
-    } else if config.hb_mode == 1 && pkt_type == b'h' {
+    if config.hb_mode == 0 || (config.hb_mode == 1 && pkt_type == b'h') {
         conn_info.my_roller = conn_info.my_roller.wrapping_add(1);
     }
 

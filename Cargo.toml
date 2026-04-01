@@ -1,11 +1,12 @@
-[workspace]
-exclude = ["udp2raw-ebpf"]
-
 [package]
 name = "udp2raw"
 version = "0.1.0"
 edition = "2021"
 description = "UDP tunnel over encrypted raw sockets (FakeTCP/UDP/ICMP)"
+
+[features]
+default = []
+xdp = [] # AF_XDP transport (Linux >= 5.7, CAP_NET_ADMIN + CAP_NET_RAW)
 
 [lib]
 name = "udp2raw"
@@ -15,27 +16,20 @@ path = "src/lib.rs"
 name = "udp2raw"
 path = "src/main.rs"
 
-[features]
-default = []
-xdp = ["dep:aya", "dep:aya-build"]
-
 [dependencies]
 # CLI
 clap = { version = "4", features = ["derive"] }
 
 # Logging
 log = "0.4"
-chrono = "0.4"
 
 # Event loop
 mio = { version = "1", features = ["os-poll", "net", "os-ext"] }
 
 # Sockets & OS
-socket2 = "0.5"
 libc = "0.2"
-nix = { version = "0.29", features = ["net", "ioctl", "signal", "fs"] }
 
-# Crypto
+# Crypto — all pinned to the cipher 0.4 / digest 0.10 ecosystem
 aes = "0.8"
 cbc = "0.1"
 cfb-mode = "0.8"
@@ -51,19 +45,12 @@ cipher = { version = "0.4", features = ["block-padding"] }
 
 # Misc
 rand = "0.8"
-bytes = "1"
-lru = "0.12"
-
-# AF_XDP (optional — only with --features xdp on Linux)
-aya = { version = "0.13", optional = true }
-
-[build-dependencies]
-aya-build = { version = "0.1", optional = true }
 
 [dev-dependencies]
 hex = "0.4"
 
 [profile.release]
-opt-level = 2
+opt-level = 3
 lto = true
+codegen-units = 1
 strip = true
