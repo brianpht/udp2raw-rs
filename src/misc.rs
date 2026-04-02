@@ -56,7 +56,7 @@ pub struct Cli {
     pub cipher_mode: String,
 
     /// Auth mode: hmac_sha1, md5, crc32, simple, none
-    #[arg(long = "auth-mode", default_value = "md5")]
+    #[arg(long = "auth-mode", default_value = "hmac_sha1")]
     pub auth_mode: String,
 
     /// Auto add/delete iptables rule

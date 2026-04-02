@@ -48,6 +48,35 @@ rand = "0.8"
 
 [dev-dependencies]
 hex = "0.4"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "encrypt_bench"
+harness = false
+
+[[bench]]
+name = "key_derivation_bench"
+harness = false
+
+[[bench]]
+name = "checksum_bench"
+harness = false
+
+[[bench]]
+name = "anti_replay_bench"
+harness = false
+
+[[bench]]
+name = "packet_build_bench"
+harness = false
+
+[[bench]]
+name = "data_structures_bench"
+harness = false
+
+[[bench]]
+name = "pipeline_bench"
+harness = false
 
 [profile.release]
 opt-level = 3

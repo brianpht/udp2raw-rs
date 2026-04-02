@@ -87,7 +87,7 @@ Options:
   -k, --key <password>      Encryption password [default: "secret key"]
       --raw-mode <mode>     faketcp | udp | icmp [default: faketcp]
       --cipher-mode <mode>  aes128cbc | aes128cfb | xor | none [default: aes128cbc]
-      --auth-mode <mode>    hmac_sha1 | md5 | crc32 | simple | none [default: md5]
+      --auth-mode <mode>    hmac_sha1 | md5 | crc32 | simple | none [default: hmac_sha1]
   -a, --auto-rule           Auto add/delete iptables rules
   -g, --gen-rule            Print iptables rule and exit
       --log-level <0-6>     0=off, 4=info, 6=trace [default: 4]
@@ -200,8 +200,8 @@ src/
 
 | Mode | Description |
 |---|---|
-| `hmac_sha1` | HMAC-SHA1 Encrypt-then-MAC (strongest) |
-| `md5` | MD5 hash (default) |
+| `hmac_sha1` | HMAC-SHA1 Encrypt-then-MAC (default, strongest) |
+| `md5` | MD5 hash |
 | `crc32` | CRC32 checksum |
 | `simple` | Simple hash |
 | `none` | No authentication (disables anti-replay) |
