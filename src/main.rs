@@ -59,7 +59,13 @@ fn main() {
     }
 
     // Initialize transport (raw sockets or AF_XDP)
-    let mut transport = init_transport(&config);
+    if config.workers > 1 && (config.raw_mode != RawMode::Icmp || config.fix_gro
+        || config.xdp_enabled || config.lower_level_enabled || !config.remote_addr.is_ipv4()
+        || !config.local_addr.is_ipv4()) {
+        eprintln!("--workers > 1 currently requires IPv4 ICMP, without GRO, XDP or lower-level mode");
+        std::process::exit(2);
+    }
+    let mut transport = init_transport(&config, &encryptor);
 
     // Setup iptables rules (auto-add)
     let mut _iptables: Option<misc::IptablesManager> = None;
@@ -111,7 +117,7 @@ extern "C" fn signal_handler(_sig: libc::c_int) {
     std::process::exit(0);
 }
 
-fn init_transport(config: &misc::Config) -> RawTransport {
+fn init_transport(config: &misc::Config, encryptor: &Encryptor) -> RawTransport {
     #[cfg(feature = "xdp")]
     if config.xdp_enabled {
         log::info!("using AF_XDP transport");
@@ -135,6 +141,12 @@ fn init_transport(config: &misc::Config) -> RawTransport {
         log::error!("hint: run as root or with CAP_NET_RAW capability");
         std::process::exit(-1);
     });
-    RawTransport::Socket(raw_state)
+    if config.workers > 1 {
+        log::info!("ordered crypto pipeline: {} workers", config.workers);
+        RawTransport::Parallel(Box::new(udp2raw::crypto_workers::ParallelTransport::new(
+            raw_state, encryptor.clone(), config.workers as usize,
+        ).expect("start crypto workers")))
+    } else {
+        RawTransport::Socket(raw_state)
+    }
 }
-

@@ -474,6 +474,9 @@ pub fn send_bare(
     buf[offset..offset + data.len()].copy_from_slice(data);
     let total = offset + data.len();
 
+    if raw_state.is_parallel() {
+        return raw_state.enqueue_encrypt(raw_info, &buf[..total]);
+    }
     let enc_len = encryptor.my_encrypt(&buf[..total], &mut buf2).map_err(|_| {
         log::debug!("send_bare: encrypt failed");
     })?;
@@ -510,7 +513,7 @@ pub fn recv_bare(
     }
 
     let mut decrypted = [0u8; BUF_LEN];
-    let dec_len = encryptor.my_decrypt(&recv_buf[..encrypted_len], &mut decrypted).map_err(|_| {
+    let dec_len = raw_state.decrypt_received(encryptor, &recv_buf[..encrypted_len], &mut decrypted).map_err(|_| {
         log::debug!("recv_bare: decrypt failed");
     })?;
 
@@ -572,7 +575,10 @@ pub fn send_safer(
     buf[offset..offset + data.len()].copy_from_slice(data);
     let total = offset + data.len();
 
-    if !config.fix_gro {
+    if raw_state.is_parallel() {
+        // IDs and anti-replay sequence have already been allocated serially.
+        raw_state.enqueue_encrypt(&conn_info.raw_info, &buf[..total])?;
+    } else if !config.fix_gro {
         let enc_len = encryptor.my_encrypt(&buf[..total], &mut buf2).map_err(|_| ())?;
         raw_state
             .send_raw0(&mut conn_info.raw_info, &buf2[..enc_len], config.raw_mode)
@@ -641,7 +647,7 @@ pub fn recv_safer_multi(
     let mut results = Vec::new();
 
     if !config.fix_gro {
-        if let Some(pkt) = parse_safer_single(conn_info, encrypted, encryptor, config)? {
+        if let Some(pkt) = parse_safer_single(raw_state, conn_info, encrypted, encryptor, config)? {
             results.push(pkt);
         }
     } else {
@@ -683,9 +689,9 @@ pub fn recv_safer_multi(
                 if single_len > 14 {
                     reconstructed[14..single_len].copy_from_slice(&encrypted[offset + 14..offset + single_len]);
                 }
-                parse_safer_single(conn_info, &reconstructed[..single_len], encryptor, config)
+                parse_safer_single(raw_state, conn_info, &reconstructed[..single_len], encryptor, config)
             } else {
-                parse_safer_single(conn_info, &encrypted[offset..offset + single_len], encryptor, config)
+                parse_safer_single(raw_state, conn_info, &encrypted[offset..offset + single_len], encryptor, config)
             };
 
             if let Ok(Some(pkt)) = decrypt_result {
@@ -703,13 +709,14 @@ pub fn recv_safer_multi(
 
 /// Parse a single safer packet.
 fn parse_safer_single(
+    raw_state: &mut RawTransport,
     conn_info: &mut ConnInfo,
     encrypted: &[u8],
     encryptor: &Encryptor,
     config: &Config,
 ) -> Result<Option<SaferPacket>, ()> {
     let mut decrypted = [0u8; BUF_LEN];
-    let dec_len = encryptor.my_decrypt(encrypted, &mut decrypted).map_err(|_| ())?;
+    let dec_len = raw_state.decrypt_received(encryptor, encrypted, &mut decrypted).map_err(|_| ())?;
 
     if dec_len < 18 {
         // 4 + 4 + 8 + 1 + 1 = 18 minimum
@@ -760,4 +767,3 @@ fn parse_safer_single(
 
     Ok(Some(SaferPacket { pkt_type, data }))
 }
-

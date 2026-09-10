@@ -244,6 +244,7 @@ pub struct RawInfo {
 /// Max raw packet size for send path (IP header + protocol header + encrypted payload).
 /// Bounded: 20 (IP) + 20 (TCP) + BUF_LEN (2200) = 2240.
 const SEND_BUF_SIZE: usize = BUF_LEN + 40;
+const IPV4_DONT_FRAGMENT: u16 = 0x4000;
 
 pub struct RawSocketState {
     pub raw_recv_fd: RawFd,
@@ -277,8 +278,10 @@ impl RawSocketState {
             };
             raw_send_fd = raw_recv_fd; // same fd for lower level
         } else if !is_ipv6 {
+            // Receive before the INPUT rules suppress kernel ICMP/TCP replies,
+            // matching C++ udp2raw. SOCK_DGRAM omits the Ethernet header.
             raw_recv_fd = unsafe {
-                libc::socket(libc::AF_INET, libc::SOCK_RAW, libc::IPPROTO_RAW)
+                libc::socket(libc::AF_PACKET, libc::SOCK_DGRAM, (libc::ETH_P_IP as u16).to_be() as i32)
             };
             raw_send_fd = unsafe {
                 libc::socket(libc::AF_INET, libc::SOCK_RAW, libc::IPPROTO_RAW)
@@ -404,7 +407,7 @@ impl RawSocketState {
                 iph.tot_len = (ip_payload_len as u16).to_be();
                 self.ip_id_counter = self.ip_id_counter.wrapping_add(1);
                 iph.id = self.ip_id_counter.to_be();
-                iph.frag_off = 0x40u16.to_be(); // Don't fragment
+                iph.frag_off = IPV4_DONT_FRAGMENT.to_be();
                 iph.ttl = 64;
                 iph.protocol = send_info.protocol;
                 iph.saddr = u32::from(src).to_be();
@@ -609,6 +612,10 @@ impl RawSocketState {
         icmp_type: u8,
     ) -> io::Result<usize> {
         let send_info = &raw_info.send_info;
+        // Reserve space for both the outer IPv4 and ICMP headers.
+        if payload.len() > SEND_BUF_SIZE - 20 - 8 {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "ICMP payload too large"));
+        }
         let icmp_len = 8 + payload.len();
         let mut icmp_buf = [0u8; SEND_BUF_SIZE];
 
@@ -618,7 +625,7 @@ impl RawSocketState {
         icmp_buf[4..6].copy_from_slice(&send_info.src_port.to_be_bytes()); // ID
         icmp_buf[6..8].copy_from_slice(&send_info.my_icmp_seq.to_be_bytes());
         if !payload.is_empty() {
-            icmp_buf[8..].copy_from_slice(payload);
+            icmp_buf[8..icmp_len].copy_from_slice(payload);
         }
 
         let checksum = csum(&icmp_buf[..icmp_len]);
@@ -940,6 +947,74 @@ fn bpf_stmt(code: u16, k: u32) -> libc::sock_filter {
     libc::sock_filter { code, jt: 0, jf: 0, k }
 }
 
+#[cfg(test)]
+mod icmp_send_regression {
+    use super::*;
+
+    #[test]
+    fn ipv4_df_is_not_a_fragment_offset() {
+        let mut header = IpHeader::default();
+        header.frag_off = IPV4_DONT_FRAGMENT.to_be();
+        assert_eq!(&header.as_bytes()[6..8], &[0x40, 0x00]);
+    }
+
+    #[test]
+    #[ignore = "requires CAP_NET_RAW; creates sockets without sending packets"]
+    fn receive_socket_uses_carrier_protocol() {
+        use clap::Parser;
+        for mode in ["icmp", "udp", "faketcp"] {
+            let cli = crate::misc::Cli::parse_from([
+                "udp2raw", "-c", "-l", "127.0.0.1:0", "-r", "127.0.0.1:41967", "--raw-mode", mode,
+            ]);
+            let socket = RawSocketState::init(&Config::from_cli(&cli)).unwrap();
+            let mut protocol: libc::c_int = 0;
+            let mut size = std::mem::size_of_val(&protocol) as libc::socklen_t;
+            let rc = unsafe {
+                libc::getsockopt(socket.raw_recv_fd, libc::SOL_SOCKET, libc::SO_DOMAIN,
+                    &mut protocol as *mut _ as *mut libc::c_void, &mut size)
+            };
+            assert_eq!(rc, 0);
+            assert_eq!(protocol, libc::AF_PACKET);
+        }
+    }
+
+    fn socket_without_fd() -> RawSocketState {
+        RawSocketState {
+            raw_recv_fd: -1,
+            raw_send_fd: -1,
+            filter_port: -1,
+            seq_mode: 3,
+            ip_id_counter: 0,
+            g_packet_buf: Vec::new(),
+            g_packet_buf_len: -1,
+            lower_level: false,
+            is_client: true,
+        }
+    }
+
+    #[test]
+    fn icmp_short_and_max_payloads_reach_send_without_panicking() {
+        // No root privileges or network traffic: EBADF means packet building
+        // completed and reached sendto, instead of panicking during the copy.
+        for len in [0, 1, 52, 1200, 1320, SEND_BUF_SIZE - 28] {
+            for icmp_type in [0, 8] {
+                let mut socket = socket_without_fd();
+                let mut info = RawInfo::default();
+                let result = socket.send_raw_icmp(&mut info, &vec![0x5a; len], icmp_type);
+                assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::EBADF));
+            }
+        }
+    }
+
+    #[test]
+    fn icmp_oversize_returns_error_without_panicking() {
+        let mut socket = socket_without_fd();
+        let mut info = RawInfo::default();
+        let result = socket.send_raw_icmp(&mut info, &vec![0; SEND_BUF_SIZE - 27], 8);
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidInput);
+    }
+}
+
 #[inline]
 fn bpf_jump(code: u16, k: u32, jt: u8, jf: u8) -> libc::sock_filter {
     libc::sock_filter { code, jt, jf, k }
@@ -1027,6 +1102,3 @@ fn build_bpf_filter_icmp(mode: ProgramMode) -> Vec<libc::sock_filter> {
         bpf_stmt(BPF_RET | BPF_K, 0),
     ]
 }
-
-
-

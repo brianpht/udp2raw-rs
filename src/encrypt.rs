@@ -102,6 +102,7 @@ impl EncryptionKeys {
 
 // ─── Encryptor struct ───────────────────────────────────────────────────────
 
+#[derive(Clone)]
 pub struct Encryptor {
     pub keys: EncryptionKeys,
     pub auth_mode: AuthMode,
@@ -660,4 +661,3 @@ mod tests {
         }
     }
 }
-
