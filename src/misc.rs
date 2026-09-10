@@ -27,6 +27,9 @@ pub const RETRY_ON_ERROR_INTERVAL: u64 = 3;
 #[derive(Parser, Debug)]
 #[command(name = "udp2raw", about = "UDP tunnel over encrypted raw sockets (FakeTCP/UDP/ICMP)")]
 pub struct Cli {
+    /// Crypto worker count (1 = original synchronous path; >1 requires IPv4 ICMP without GRO/XDP).
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u16).range(1..=16))]
+    pub workers: u16,
     /// Run as client
     #[arg(short = 'c', long = "client", group = "mode")]
     pub client: bool,
@@ -188,6 +191,7 @@ pub struct Cli {
 
 #[derive(Debug, Clone)]
 pub struct Config {
+    pub workers: u16,
     pub program_mode: ProgramMode,
     pub raw_mode: RawMode,
     pub cipher_mode: CipherMode,
@@ -302,6 +306,7 @@ impl Config {
 
 
         Config {
+            workers: cli.workers,
             program_mode,
             raw_mode,
             cipher_mode,
@@ -568,4 +573,3 @@ fn build_iptables_pattern(config: &Config) -> String {
         _ => String::new(),
     }
 }
-

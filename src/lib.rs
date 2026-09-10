@@ -7,6 +7,7 @@
 compile_error!("udp2raw only supports Linux (requires raw sockets, timerfd, iptables)");
 
 pub mod client;
+pub mod crypto_workers;
 pub mod common;
 pub mod connection;
 pub mod encrypt;
@@ -20,4 +21,3 @@ pub mod transport;
 #[cfg(feature = "xdp")]
 #[allow(dead_code)]
 pub mod xdp;
-

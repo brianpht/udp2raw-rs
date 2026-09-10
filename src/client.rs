@@ -94,6 +94,10 @@ pub fn client_event_loop(
     // Setup mio poll
     let mut poll = Poll::new()?;
     let mut events = Events::with_capacity(128);
+    if raw_state.is_parallel() {
+        raw_state.set_crypto_waker(std::sync::Arc::new(mio::Waker::new(
+            poll.registry(), crate::crypto_workers::CRYPTO_TOKEN)?));
+    }
 
     let mut udp_source = MioFdSource { fd: udp_fd };
     let mut raw_source = MioFdSource {
@@ -148,8 +152,17 @@ pub fn client_event_loop(
                         config,
                         udp_fd,
                     );
+                    // Handlers consume one datagram. Rearm edge-triggered mio
+                    // so queued datagrams are not stranded until new traffic.
+                    poll.registry().reregister(&mut udp_source, UDP_TOKEN, Interest::READABLE)?;
                 }
-                RAW_TOKEN => {
+                token if token == RAW_TOKEN || token == crate::crypto_workers::CRYPTO_TOKEN => {
+                    if raw_state.is_parallel() {
+                        raw_state.pump_crypto()?;
+                        while raw_state.has_crypto_packet() {
+                            client_on_raw_recv(&mut conn_info, raw_state, encryptor, config, udp_fd);
+                        }
+                    } else {
                     client_on_raw_recv(
                         &mut conn_info,
                         raw_state,
@@ -157,6 +170,8 @@ pub fn client_event_loop(
                         config,
                         udp_fd,
                     );
+                    }
+                    poll.registry().reregister(&mut raw_source, RAW_TOKEN, Interest::READABLE)?;
                 }
                 FIFO_TOKEN => {
                     if let Some(fd) = fifo_fd {
@@ -654,4 +669,3 @@ fn create_fifo(path: &str) -> io::Result<RawFd> {
     }
     Ok(fd)
 }
-

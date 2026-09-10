@@ -44,6 +44,10 @@ pub fn server_event_loop(
     // Setup mio poll
     let mut poll = Poll::new()?;
     let mut events = Events::with_capacity(4096);
+    if raw_state.is_parallel() {
+        raw_state.set_crypto_waker(std::sync::Arc::new(mio::Waker::new(
+            poll.registry(), crate::crypto_workers::CRYPTO_TOKEN)?));
+    }
 
     let mut raw_source = MioFdSource { fd: raw_state.recv_fd() };
     poll.registry().register(&mut raw_source, RAW_TOKEN, Interest::READABLE)?;
@@ -91,7 +95,15 @@ pub fn server_event_loop(
                     }
                 }
 
-                RAW_TOKEN => {
+                token if token == RAW_TOKEN || token == crate::crypto_workers::CRYPTO_TOKEN => {
+                    if raw_state.is_parallel() {
+                        raw_state.pump_crypto()?;
+                        while raw_state.has_crypto_packet() {
+                            server_on_raw_recv(&mut conn_manager, &mut fd_manager, raw_state,
+                                encryptor, config, const_id, &mut poll, &mut next_token_id,
+                                &mut token_to_fd64, &mut fd64_to_token, &hb_buf);
+                        }
+                    } else {
                     server_on_raw_recv(
                         &mut conn_manager,
                         &mut fd_manager,
@@ -105,6 +117,9 @@ pub fn server_event_loop(
                         &mut fd64_to_token,
                         &hb_buf,
                     );
+                    }
+                    // Rearm after the single-packet handler to service backlog.
+                    poll.registry().reregister(&mut raw_source, RAW_TOKEN, Interest::READABLE)?;
                 }
 
                 token => {
@@ -116,6 +131,8 @@ pub fn server_event_loop(
                                 if let Some(addr) = info.conn_info_key {
                                     if let Some(conn) = conn_manager.mp.get_mut(&addr) {
                                         server_on_udp_recv(conn, fd64, &fd_manager, raw_state, encryptor, config);
+                                        let mut source = MioFdSource { fd: fd_manager.to_fd(fd64) };
+                                        poll.registry().reregister(&mut source, token, Interest::READABLE)?;
                                     }
                                 }
                             }
@@ -638,4 +655,3 @@ fn create_connected_udp_fd(remote: &SocketAddr) -> io::Result<RawFd> {
 
     Ok(fd)
 }
-
